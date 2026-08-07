@@ -1,0 +1,7 @@
+# Pipeline de transcription + diarisation locale
+# À installer dans un environnement virtuel Python 3.10+ sur un Mac Apple Silicon
+# (mlx-whisper ne fonctionne pas sur Mac Intel, Windows ou Linux).
+
+mlx-whisper>=0.4.0
+pyannote.audio>=3.1.0
+torch>=2.1.0
