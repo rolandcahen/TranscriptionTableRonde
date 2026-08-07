@@ -85,9 +85,9 @@ Au premier lancement, ouvrez les **Réglages** (`⌘,`) et renseignez :
 
 ## Documentation complète
 
-[`docs/Notice_utilisation_TranscriptionTableRonde.docx`](docs/Notice_utilisation_TranscriptionTableRonde.docx) —
-principes, fonctionnement détaillé de chaque fenêtre, format du fichier de
-contexte pour le traitement par lots, limitations connues.
+[`docs/NOTICE.md`](docs/NOTICE.md) — principes, installation détaillée
+(développeur ou poste utilisateur), fonctionnement de chaque fenêtre, format
+du fichier de contexte pour le traitement par lots, limitations connues.
 
 ## Structure du dépôt
 
