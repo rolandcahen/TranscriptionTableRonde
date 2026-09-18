@@ -17,61 +17,69 @@ modèles (Hugging Face), ensuite mis en cache — jamais l'audio lui-même.
 - **Mac Apple Silicon** (M1 ou plus récent) — mlx-whisper ne fonctionne pas
   sur Mac Intel.
 - macOS 14 (Sonoma) ou plus récent.
-- [Xcode](https://apps.apple.com/app/xcode/id497799835) (pour compiler l'app).
-- Python 3.10+ (`python3 --version`).
+- [Xcode](https://apps.apple.com/app/xcode/id497799835) ou ses Command Line
+  Tools (pour compiler l'app).
+- [Homebrew](https://brew.sh) installé.
 - Un compte [Hugging Face](https://huggingface.co) gratuit.
 
-## 1. Installer le pipeline Python
+## Installation (recommandé : un seul script)
+
+Un script installe tout automatiquement : ffmpeg, l'environnement Python du
+pipeline et ses dépendances, Ollama + Mistral, puis il compile et installe
+l'application.
 
 ```bash
-# Homebrew si absent (https://brew.sh), puis ffmpeg
-brew install ffmpeg
-
-# Environnement virtuel — installé ici pour que l'app le retrouve
-# automatiquement sans configuration (chemin par défaut des Réglages)
-mkdir -p ~/transcription_pipeline
-cp pipeline/*.py pipeline/requirements.txt ~/transcription_pipeline/
-cd ~/transcription_pipeline
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+git clone https://github.com/rolandcahen/TranscriptionTableRonde.git
+cd TranscriptionTableRonde
+chmod +x TranscriptionTableRonde_install.sh
+./TranscriptionTableRonde_install.sh
 ```
 
-### Compte Hugging Face et modèle de diarisation
+Comptez 10 à 20 minutes selon votre connexion (le téléchargement de `torch`
+et du modèle Mistral sont les étapes les plus longues). Le script s'arrête
+avec un message clair si Xcode ou Homebrew manquent, plutôt que de tenter
+une installation à moitié faite.
 
-1. Créez un compte gratuit sur [huggingface.co](https://huggingface.co).
-2. Acceptez les conditions d'utilisation du modèle de diarisation :
-   [huggingface.co/pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-   (nécessite aussi l'acceptation du modèle de segmentation associé,
-   [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-   — un lien apparaît sur la page ci-dessus).
-3. Créez un token d'accès : [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+Ce script est conçu pour être relancé à l'identique sur plusieurs machines :
+chaque installation est indépendante et 100 % locale (rien n'est partagé ni
+désinstallé ailleurs). Pour répartir le travail sur plusieurs Mac, installez
+sur chacun puis utilisez le traitement par lots (icône 🗂️) avec un dossier
+de fichiers différent par machine.
 
-### Ollama (résumé structuré, optionnel)
+Par défaut, le script installe dans `~/transcription_pipeline` (pipeline) et
+`~/Applications` (app). Réglable :
 
 ```bash
-brew install ollama
-ollama pull mistral
+PIPELINE_DIR=~/ma_config APP_DEST_DIR=/Applications ./TranscriptionTableRonde_install.sh
 ```
 
-## 2. Installer l'application
+Pour sauter Ollama/Mistral (résumé automatique désactivé) :
+`SKIP_OLLAMA=1 ./TranscriptionTableRonde_install.sh`.
 
-```bash
-git clone <url-de-ce-dépôt>
-cd TranscriptionTableRonde/app
-open TranscriptionTableRonde.xcodeproj
-```
+> Astuce : vous pouvez renommer le script en `install.sh`
+> (`git mv TranscriptionTableRonde_install.sh install.sh`) si vous préférez
+> un nom plus court — adaptez alors les commandes ci-dessus en conséquence.
 
-Dans Xcode : sélectionnez le schéma **TranscriptionTableRonde**, puis
-**Product → Run** (`⌘R`).
+### Après l'installation
 
-Au premier lancement, ouvrez les **Réglages** (`⌘,`) et renseignez :
+1. Créez un compte [Hugging Face](https://huggingface.co) gratuit et
+   acceptez les conditions d'utilisation de ces deux modèles (nécessaire
+   pour la diarisation) :
+   - [huggingface.co/pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
+   - [huggingface.co/pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+2. Créez un token d'accès : [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+3. Ouvrez l'app depuis `~/Applications` (clic droit → Ouvrir au tout premier
+   lancement, avertissement Gatekeeper normal pour une app non signée par un
+   compte développeur Apple payant), allez dans ses **Réglages** (`⌘,`) et
+   collez le token — stocké dans le trousseau macOS, jamais en clair sur le
+   disque.
 
-- **Dossier du pipeline** : `~/transcription_pipeline` (déjà le bon si vous
-  avez suivi l'étape 1 ci-dessus).
-- **Interpréteur Python (venv)** : `~/transcription_pipeline/venv/bin/python3`.
-- **Token Hugging Face** : collé depuis l'étape précédente — stocké dans le
-  trousseau macOS, jamais en clair sur le disque.
+## Installation manuelle / développement
+
+Pour comprendre chaque étape, la personnaliser, ou travailler sur le code
+dans Xcode plutôt que de simplement utiliser l'app compilée, voir
+[`docs/NOTICE.md`](docs/NOTICE.md#2-installation) qui détaille la procédure
+pas à pas (pipeline Python, Ollama, compilation via Xcode).
 
 ## Utilisation rapide
 
@@ -86,12 +94,14 @@ Au premier lancement, ouvrez les **Réglages** (`⌘,`) et renseignez :
 ## Documentation complète
 
 [`docs/NOTICE.md`](docs/NOTICE.md) — principes, installation détaillée
-(développeur ou poste utilisateur), fonctionnement de chaque fenêtre, format
-du fichier de contexte pour le traitement par lots, limitations connues.
+(automatique, développeur, ou poste utilisateur), fonctionnement de chaque
+fenêtre, format du fichier de contexte pour le traitement par lots,
+limitations connues.
 
 ## Structure du dépôt
 
 ```
+TranscriptionTableRonde_install.sh   Installation automatique (recommandé)
 app/           Projet Xcode (SwiftUI)
 pipeline/      Scripts Python (transcription, diarisation, résumé)
 docs/          Notice d'utilisation
@@ -100,7 +110,9 @@ docs/          Notice d'utilisation
 ## Limitations connues
 
 - Mac Apple Silicon uniquement.
-- Pas encore de `.dmg` packagé — installation par compilation Xcode
-  uniquement pour l'instant (voir ci-dessus).
-- Pas de mise à jour automatique — reclonez et recompilez pour les
-  nouvelles versions.
+- Pas de `.dmg` packagé ni de signature par un compte développeur Apple
+  payant — le script d'installation compile depuis le code source avec une
+  signature ad-hoc (usage local), Gatekeeper affiche un avertissement au
+  premier lancement de l'app.
+- Pas de mise à jour automatique — reclonez (ou téléchargez le zip à jour)
+  et relancez le script d'installation pour les nouvelles versions.
