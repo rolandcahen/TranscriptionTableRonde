@@ -44,12 +44,15 @@ des outils pour vérifier/corriger et résumer les résultats.
 
 ## 2. Installation
 
-> Deux profils différents : suivez **2.A** si vous compilez et développez
-> l'application (nouvelle machine de travail, mise à jour du code), ou
-> **2.B** si vous recevez simplement l'application déjà compilée pour
-> l'utiliser au labo, sans toucher au code.
+> Trois façons de faire, du plus simple au plus manuel : **2.0** pour
+> installer en une commande sur une nouvelle machine (recommandé, y compris
+> pour un simple poste d'utilisation) ; **2.A** si vous voulez comprendre ou
+> personnaliser chaque étape, ou travailler sur le code dans Xcode ; **2.B**
+> si on vous a transmis directement `TranscriptionTableRonde.app` déjà
+> compilée (clé USB, AirDrop) et que vous ne voulez pas du tout de Terminal
+> pour la partie compilation.
 
-### Prérequis (dans les deux cas)
+### Prérequis (dans les trois cas)
 
 - **Mac Apple Silicon** (puce M1 ou plus récente) — mlx-whisper ne
   fonctionne pas sur Mac Intel.
@@ -58,7 +61,50 @@ des outils pour vérifier/corriger et résumer les résultats.
   des conditions d'utilisation des modèles pyannote utilisés pour la
   diarisation, et un jeton d'accès (« token », commence par `hf_`).
 
-### 2.A Installation développeur (clonage + compilation)
+### 2.0 Installation automatique (recommandé)
+
+Un script installe tout en une commande : ffmpeg, pipeline Python complet
+(avec son environnement virtuel), Ollama + Mistral, puis compile et installe
+l'application dans `~/Applications`.
+
+```bash
+git clone https://github.com/rolandcahen/TranscriptionTableRonde.git
+cd TranscriptionTableRonde
+chmod +x TranscriptionTableRonde_install.sh
+./TranscriptionTableRonde_install.sh
+```
+
+Comptez 10 à 20 minutes (le téléchargement de `torch` et du modèle Mistral
+sont les étapes les plus longues). Le script vérifie Xcode et Homebrew au
+démarrage et s'arrête avec un message clair s'ils manquent, plutôt que de
+laisser une installation à moitié faite.
+
+Il est prévu pour être relancé à l'identique sur plusieurs Mac : chaque
+installation est indépendante et entièrement locale (rien n'est partagé, ni
+désinstallé, d'une machine à l'autre). Pour répartir un lot d'enregistrements
+sur plusieurs machines, installez sur chacune puis utilisez le traitement
+par lots ([4.4](#44-fenêtre-traitement-par-lots)) avec un dossier différent
+par machine.
+
+Deux variables d'environnement optionnelles :
+
+```bash
+# Emplacements différents du défaut (~/transcription_pipeline, ~/Applications)
+PIPELINE_DIR=~/ma_config APP_DEST_DIR=/Applications ./TranscriptionTableRonde_install.sh
+
+# Sans Ollama/Mistral (le résumé automatique restera indisponible)
+SKIP_OLLAMA=1 ./TranscriptionTableRonde_install.sh
+```
+
+Une fois le script terminé, il ne reste que la création du token Hugging
+Face (étape 3 de 2.A juste en dessous) puis [« Configuration au premier
+lancement »](#configuration-au-premier-lancement) — les autres étapes de
+2.A (pipeline, Ollama, compilation) sont déjà faites par le script.
+
+### 2.A Installation développeur (étape par étape)
+
+Pour comprendre ou personnaliser chaque étape plutôt que de passer par
+2.0, ou pour travailler sur le code dans Xcode :
 
 **1. Cloner le dépôt**
 
@@ -130,9 +176,12 @@ transmis par clé USB, AirDrop, etc.) :
    nécessaire qu'une seule fois.
 4. Configurez l'application au premier lancement — voir ci-dessous.
 
-> Un installateur en un clic (`.dmg` + script d'installation du pipeline)
-> qui éviterait le Terminal est envisagé mais n'existe pas encore — voir
-> [Limitations connues](#6-limitations-connues).
+> Pour ce cas précis (app déjà compilée, transmise directement), 2.0 ne
+> s'applique pas telle quelle puisqu'elle recompile depuis le code source —
+> mais rien n'empêche de lancer quand même
+> `TranscriptionTableRonde_install.sh` sur le poste receveur pour préparer
+> pipeline + Ollama automatiquement, puis de remplacer l'app qu'il vient de
+> compiler par celle reçue si vous préférez ne pas recompiler localement.
 
 ### Configuration au premier lancement
 
@@ -408,9 +457,12 @@ enregistrements).
 
 ## 6. Limitations connues
 
-- **Pas de diffusion packagée** — l'installation reste manuelle
-  ([section 2](#2-installation)). Un installateur en un clic (`.dmg` +
-  script d'installation du pipeline) est prévu mais pas encore réalisé.
+- **Pas de `.dmg` packagé ni de signature par un compte développeur Apple
+  payant** — l'installation automatique ([2.0](#20-installation-automatique-recommandé))
+  compile depuis le code source avec une signature ad-hoc (usage local),
+  d'où l'avertissement Gatekeeper au premier lancement. Pas de double-clic
+  sur un `.dmg` téléchargé : `TranscriptionTableRonde_install.sh` reste une
+  commande à lancer dans le Terminal, une fois par machine.
 - **Fermeture de l'application pendant un traitement** — quitter
   l'application ne termine pas toujours proprement le processus Python en
   cours ; en cas de doute, vérifier via le Moniteur d'activité qu'aucun
@@ -418,9 +470,10 @@ enregistrements).
   le même fichier.
 - **Traitement par lots : dossier racine uniquement** — les sous-dossiers ne
   sont pas parcourus automatiquement dans cette version.
-- **Pas de mise à jour automatique** — toute nouvelle version de
-  l'application doit être réinstallée manuellement (`git pull` + recompiler,
-  ou remplacement dans le dossier Applications).
+- **Pas de mise à jour automatique** — toute nouvelle version doit être
+  réinstallée manuellement : `git pull` (ou nouveau téléchargement du zip)
+  puis relancer `TranscriptionTableRonde_install.sh`, qui écrase l'ancienne
+  app dans `~/Applications` et met à jour le pipeline en place.
 
 ## 7. Glossaire
 
