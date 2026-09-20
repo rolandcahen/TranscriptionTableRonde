@@ -41,6 +41,14 @@ final class PipelineRunner: ObservableObject {
         var environment = ProcessInfo.processInfo.environment
         let extraPaths = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin"
         environment["PATH"] = extraPaths + ":" + (environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+
+        // torchcodec (utilisé par pyannote pour décoder l'audio) charge les
+        // bibliothèques FFmpeg via @rpath, qui ne se résout pas tout seul
+        // avec un FFmpeg installé par Homebrew : sans ce chemin explicite,
+        // la diarisation échoue avec "Could not load libtorchcodec" /
+        // "no LC_RPATH's found", même si FFmpeg est bien installé.
+        let dyldPaths = "/opt/homebrew/lib:/opt/homebrew/opt/ffmpeg/lib:/usr/local/lib:/usr/local/opt/ffmpeg/lib"
+        environment["DYLD_FALLBACK_LIBRARY_PATH"] = dyldPaths + ":" + (environment["DYLD_FALLBACK_LIBRARY_PATH"] ?? "")
         // Python met sa sortie standard en mémoire tampon quand elle n'est
         // pas connectée à un terminal (cas d'un Pipe) : sans ça, les
         // messages d'étape ("[2/3] Diarisation...") peuvent rester coincés
