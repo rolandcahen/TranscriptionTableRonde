@@ -20,6 +20,7 @@ Voir README.md pour l'installation complète (dépendances, token Hugging Face).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -28,6 +29,24 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+# Doit être défini AVANT le premier import de torch (fait plus bas, dans
+# diarize()) : sur Apple Silicon, quelques opérations utilisées par
+# pyannote — notamment la FFT des filtres mel du modèle d'empreintes
+# vocales — n'existent pas encore côté MPS. Sans ce drapeau, la
+# diarisation sur GPU s'arrête net sur une NotImplementedError ; avec lui,
+# ces opérations-là seules retombent sur le CPU, le reste (les
+# convolutions, qui dominent le temps de calcul) restant sur le GPU.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+# Doit aussi précéder l'import de torch : rend les bibliothèques FFmpeg de
+# Homebrew visibles pour torchcodec, quitte à relancer l'interpréteur une
+# fois (voir ffmpeg_paths.py). Sans ça, la diarisation échoue sur « Could
+# not load libtorchcodec » dès qu'on lance le script hors de l'app macOS,
+# qui est la seule à poser la variable d'environnement nécessaire.
+from ffmpeg_paths import ensure_ffmpeg_visible
+
+ensure_ffmpeg_visible()
 
 from align import assign_speakers, merge_consecutive
 
@@ -96,7 +115,144 @@ def transcribe(audio_path: str, model: str, language: str, context: str | None):
     return result["segments"]
 
 
-def diarize(audio_path: str, hf_token: str, num_speakers: int | None):
+def _transcription_signature(audio_path: Path, model: str, language: str, context: str | None) -> dict:
+    """Empreinte de ce qui influence le résultat de la transcription.
+
+    Sert à ne réutiliser un cache que s'il correspond exactement au même
+    audio et aux mêmes paramètres : changer de modèle, de langue ou de
+    contexte doit refaire la transcription, pas recycler l'ancienne.
+    """
+    stat = audio_path.stat()
+    return {
+        "version": 1,
+        "audio_name": audio_path.name,
+        "audio_size": stat.st_size,
+        "audio_mtime": int(stat.st_mtime),
+        "model": model,
+        "language": language,
+        "context_sha1": hashlib.sha1((context or "").encode("utf-8")).hexdigest(),
+    }
+
+
+def load_cached_transcription(cache_path: Path, signature: dict):
+    """Relit la transcription déjà calculée pour cet audio, s'il y en a une.
+
+    L'étape 1 (Whisper) peut prendre plusieurs dizaines de minutes et
+    l'étape 2 (diarisation) bien davantage : sans ce cache, la moindre
+    interruption pendant l'étape 2 obligeait à tout refaire depuis le
+    début, alors que la transcription, elle, était déjà terminée.
+    """
+    if not cache_path.exists():
+        return None
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if payload.get("signature") != signature:
+        return None
+    segments = payload.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return None
+    print(f"[1/3] Transcription déjà calculée — réutilisation de {cache_path.name} ({len(segments)} segments)")
+    return segments
+
+
+def save_transcription_cache(cache_path: Path, signature: dict, segments: list) -> None:
+    payload = {"signature": signature, "segments": _sanitize_json_floats(segments)}
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except OSError as exc:
+        # Le cache est un confort, pas une condition de réussite.
+        print(f"      (impossible d'enregistrer le cache de transcription : {exc})")
+
+
+# Phases internes de pyannote, avec le libellé affiché et la part qu'elles
+# représentent sur l'échelle 0-100 % de l'étape 2. Les bornes sont
+# empiriques : l'extraction des empreintes vocales domine très largement le
+# temps de calcul, la segmentation vient loin derrière, et le regroupement
+# finit en quelques instants. Sans ce découpage, chaque phase repartirait de
+# 0 % et la barre de progression ferait plusieurs allers-retours.
+_DIARIZATION_PHASES = {
+    "segmentation": ("segmentation de la parole", 0.0, 30.0),
+    "embeddings": ("empreintes vocales", 30.0, 95.0),
+    "speaker_counting": ("comptage des locuteurs", 95.0, 97.0),
+    "discrete_diarization": ("assemblage des tours de parole", 97.0, 100.0),
+}
+
+
+class DiarizationProgress:
+    """Hook pyannote qui imprime une progression en texte simple.
+
+    pyannote fournit bien un `ProgressHook`, mais il dessine une barre
+    interactive à coups de retours chariot : dans le journal de l'app
+    macOS, qui empile des lignes, ça produirait des centaines de lignes
+    illisibles. On imprime donc une ligne courte, au plus toutes les
+    `min_interval` secondes, dans un format que `PipelineRunner.swift` sait
+    relire pour alimenter sa barre de progression.
+    """
+
+    def __init__(self, min_interval: float = 5.0):
+        self.min_interval = min_interval
+        self._last_print = 0.0
+        self._step = None
+
+    def __call__(self, step_name, step_artifact, file=None, total=None, completed=None):
+        label, start, end = _DIARIZATION_PHASES.get(step_name, (step_name, None, None))
+
+        if step_name != self._step:
+            self._step = step_name
+            self._last_print = 0.0
+
+        # Phase sans progression chiffrée : on annonce juste son début.
+        if not total or completed is None or start is None:
+            if completed is None:
+                print(f"      Diarisation — {label}", flush=True)
+            return
+
+        now = time.time()
+        if completed < total and (now - self._last_print) < self.min_interval:
+            return
+        self._last_print = now
+
+        overall = start + (end - start) * min(completed / total, 1.0)
+        print(f"      Diarisation {overall:.0f}% — {label}", flush=True)
+
+
+def _select_device(preference: str):
+    """Choisit le périphérique de calcul pour pyannote.
+
+    Par défaut ("auto"), le GPU Apple (MPS) s'il est disponible : le modèle
+    d'empreintes vocales, qui représente l'essentiel du temps de calcul, y
+    est nettement plus rapide que sur CPU. `--device cpu` force l'ancien
+    comportement si jamais MPS pose problème.
+    """
+    import torch
+
+    if preference == "cpu":
+        return torch.device("cpu")
+    if not torch.backends.mps.is_available():
+        if preference == "mps":
+            print("      GPU (MPS) demandé mais indisponible — repli sur le CPU.")
+        return torch.device("cpu")
+    return torch.device("mps")
+
+
+def _apply_pipeline(pipeline, audio_path: str, hook, kwargs: dict):
+    """Lance le pipeline, en se passant du hook si la version installée ne
+    le connaît pas — la progression est un confort, pas une dépendance."""
+    try:
+        return pipeline(audio_path, hook=hook, **kwargs)
+    except TypeError as exc:
+        if "hook" not in str(exc):
+            raise
+        print("      (cette version de pyannote n'expose pas de progression : étape 2 sans pourcentage)")
+        return pipeline(audio_path, **kwargs)
+
+
+def diarize(audio_path: str, hf_token: str, num_speakers: int | None, device_preference: str = "auto"):
+    import torch
     from pyannote.audio import Pipeline
 
     print("[2/3] Diarisation (détection des locuteurs) avec pyannote...")
@@ -105,13 +261,33 @@ def diarize(audio_path: str, hf_token: str, num_speakers: int | None):
         "pyannote/speaker-diarization-3.1",
         token=hf_token,
     )
+
     kwargs = {}
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
-    diarization = pipeline(audio_path, **kwargs)
+    hook = DiarizationProgress()
+
+    device = _select_device(device_preference)
+    print(f"      calcul sur {'GPU (MPS)' if device.type == 'mps' else 'CPU'}")
+    try:
+        pipeline.to(device)
+        diarization = _apply_pipeline(pipeline, audio_path, hook, kwargs)
+    except Exception as exc:
+        # Un échec propre au GPU ne doit pas faire perdre le travail : on
+        # reprend la diarisation sur le CPU, plus lent mais éprouvé.
+        if device.type != "mps":
+            raise
+        print(f"      Échec de la diarisation sur le GPU : {exc}")
+        print("      Reprise depuis le début sur le CPU (plus lent, mais fiable)...")
+        pipeline.to(torch.device("cpu"))
+        diarization = _apply_pipeline(pipeline, audio_path, hook, kwargs)
+
+    # pyannote 4.x renvoie un objet structuré (.speaker_diarization),
+    # pyannote 3.x renvoie directement l'Annotation : on accepte les deux.
+    annotation = getattr(diarization, "speaker_diarization", diarization)
     turns = [
         (turn.start, turn.end, speaker)
-        for turn, _, speaker in diarization.speaker_diarization.itertracks(yield_label=True)
+        for turn, _, speaker in annotation.itertracks(yield_label=True)
     ]
     nb_locuteurs = len({s for _, _, s in turns})
     print(f"      terminé en {time.time() - t0:.0f}s — {nb_locuteurs} locuteur(s) détecté(s)")
@@ -197,6 +373,17 @@ def main():
         help="Token Hugging Face (ou variable d'environnement HF_TOKEN)",
     )
     parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "mps", "cpu"],
+        help="Périphérique de calcul pour la diarisation (défaut : auto = GPU Apple si disponible)",
+    )
+    parser.add_argument(
+        "--force-transcription",
+        action="store_true",
+        help="Refaire la transcription même si un résultat en cache existe pour ce fichier",
+    )
+    parser.add_argument(
         "--context",
         default=None,
         help="Contexte de la réunion (sujet, participants, organismes, termes techniques) : "
@@ -223,11 +410,24 @@ def main():
     if args.context:
         (out_dir / f"{basename}_contexte.txt").write_text(args.context, encoding="utf-8")
 
+    cache_path = out_dir / f"{basename}_whisper_raw.json"
+    signature = _transcription_signature(audio_path, args.model, args.language, args.context)
+
     print("Normalisation de l'audio (conversion en WAV 16 kHz mono)...")
     normalized_path = normalize_audio(audio_path)
     try:
-        whisper_segments = transcribe(str(normalized_path), args.model, args.language, args.context)
-        diarization_turns = diarize(str(normalized_path), args.hf_token, args.num_speakers)
+        whisper_segments = None
+        if not args.force_transcription:
+            whisper_segments = load_cached_transcription(cache_path, signature)
+        if whisper_segments is None:
+            whisper_segments = transcribe(str(normalized_path), args.model, args.language, args.context)
+            # Écrit sur disque immédiatement : si la diarisation échoue ou
+            # est interrompue, cette transcription-là est acquise et la
+            # prochaine exécution repartira directement de l'étape 2.
+            save_transcription_cache(cache_path, signature, whisper_segments)
+        diarization_turns = diarize(
+            str(normalized_path), args.hf_token, args.num_speakers, args.device
+        )
     finally:
         normalized_path.unlink(missing_ok=True)
 

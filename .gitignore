@@ -11,3 +11,6 @@ DerivedData/
 pipeline/venv/
 pipeline/__pycache__/
 *.pyc
+
+# Compilation temporaire (script d installation)
+app/.build_tmp/
