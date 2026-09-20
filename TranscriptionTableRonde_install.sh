@@ -117,7 +117,7 @@ rm -rf "$BUILD_DIR"
 # strictement local, sur n'importe quelle machine.
 xcodebuild \
     -project "$XCODEPROJ" \
-    -target "$APP_TARGET" \
+    -scheme "$APP_TARGET" \
     -configuration Release \
     -derivedDataPath "$BUILD_DIR" \
     CODE_SIGN_STYLE=Manual \

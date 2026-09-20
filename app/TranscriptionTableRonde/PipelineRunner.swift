@@ -128,10 +128,12 @@ final class PipelineRunner: ObservableObject {
         }
     }
 
-    /// Déduit une progression approximative des messages d'étape
-    /// ("[1/3] ...") et des barres tqdm de mlx-whisper ("46%|...frames/s]").
-    /// La diarisation et la fusion n'exposent pas de progression chiffrée
-    /// côté script : la barre reste indéterminée pendant ces étapes.
+    /// Déduit une progression des messages d'étape ("[1/3] ..."), des
+    /// barres tqdm de mlx-whisper ("46%|...frames/s]") et des lignes de
+    /// progression de la diarisation émises par le script
+    /// ("      Diarisation 42% — empreintes vocales", voir la classe
+    /// DiarizationProgress dans transcribe_diarize.py). Seule l'étape 3,
+    /// très courte, reste indéterminée.
     private func updateProgress(for line: String) {
         if line.hasPrefix("[1/3]") {
             currentStage = 1
@@ -141,7 +143,7 @@ final class PipelineRunner: ObservableObject {
         }
         if line.hasPrefix("[2/3]") {
             currentStage = 2
-            progressFraction = nil
+            progressFraction = 0
             progressLabel = "Étape 2/3 — Diarisation (identification des locuteurs)"
             return
         }
@@ -156,6 +158,12 @@ final class PipelineRunner: ObservableObject {
             return
         }
 
+        if currentStage == 2, let (percent, phase) = diarizationProgress(in: line) {
+            progressFraction = Double(percent) / 100
+            progressLabel = "Étape 2/3 — Diarisation · \(phase)"
+            return
+        }
+
         guard currentStage == 1, line.contains("frames/s"), let percent = tqdmPercent(in: line) else { return }
         progressFraction = Double(percent) / 100
     }
@@ -163,5 +171,21 @@ final class PipelineRunner: ObservableObject {
     private func tqdmPercent(in line: String) -> Int? {
         guard let range = line.range(of: "%|") else { return nil }
         return Int(line[..<range.lowerBound].trimmingCharacters(in: .whitespaces))
+    }
+
+    /// Relit une ligne "Diarisation 42% — empreintes vocales" et en extrait
+    /// le pourcentage global de l'étape 2 et le nom de la phase en cours.
+    /// Retourne nil pour les lignes sans pourcentage (annonce d'une phase
+    /// qui n'expose pas d'avancement chiffré), qui laissent la barre où
+    /// elle en est plutôt que de la faire reculer.
+    private func diarizationProgress(in line: String) -> (Int, String)? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("Diarisation ") else { return nil }
+        let rest = trimmed.dropFirst("Diarisation ".count)
+        guard let percentEnd = rest.firstIndex(of: "%"),
+              let percent = Int(rest[..<percentEnd].trimmingCharacters(in: .whitespaces)) else { return nil }
+        let phase = rest[rest.index(after: percentEnd)...]
+            .trimmingCharacters(in: CharacterSet(charactersIn: " —-"))
+        return (percent, phase.isEmpty ? "en cours" : phase)
     }
 }

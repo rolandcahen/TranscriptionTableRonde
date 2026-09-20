@@ -6,6 +6,14 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section("Fichiers") {
+                pathRow(label: "Dossier des enregistrements", path: $settings.recordingsFolder, chooseDirectory: true)
+                pathRow(label: "Dossier de sauvegarde (transcriptions)", path: $settings.outputRootFolder, chooseDirectory: true)
+                Text("Si le dossier de sauvegarde est vide, chaque transcription est enregistrée à côté de son fichier audio (comportement historique).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Pipeline Python") {
                 pathRow(label: "Dossier du pipeline", path: $settings.pipelineFolder, chooseDirectory: true)
                 pathRow(label: "Interpréteur Python (venv)", path: $settings.pythonPath, chooseDirectory: false)

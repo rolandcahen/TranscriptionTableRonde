@@ -72,34 +72,68 @@ final class BatchQueueManager: ObservableObject {
         return Double(doneCount) / Double(jobs.count)
     }
 
-    // MARK: - Scan de dossier et résolution du contexte
+    // MARK: - Scan de dossier, ajout ponctuel et résolution du contexte
 
     private struct FileInfo {
         var context: String?
         var numSpeakers: Int?
     }
 
-    /// Priorité du contexte par fichier :
-    /// 1. Fichier maître "Contexte" (nom sans extension, insensible à la
-    ///    casse — couvre `Contexte`, `Contexte.txt`, `contexte.txt`) : si
-    ///    son contenu contient des blocs séparés par une ligne vide dont la
-    ///    première ligne correspond au nom exact d'un audio, ce bloc sert
-    ///    de contexte spécifique à cet audio. Dans ce bloc, une ligne du
-    ///    type "Locuteurs: 5" (voir `parseSpeakerCount`) est extraite comme
-    ///    nombre de locuteurs pour ce fichier et retirée du texte de
-    ///    contexte. Si aucun bloc du fichier maître ne correspond à un nom
-    ///    d'audio (texte libre sans en-têtes reconnus), tout son contenu
-    ///    sert de contexte commun à tous les audios (comportement
-    ///    historique de `contexte.txt`).
-    /// 2. Fichier texte de même nom que l'audio (spécifique) — concaténé
-    ///    après le contexte résolu ci-dessus si les deux existent.
-    /// Racine du dossier uniquement, pas de sous-dossiers dans cette version.
-    func scanFolder(_ folder: URL) {
+    /// Énumère tous les fichiers audio d'un dossier et les ajoute à la file
+    /// via `addFiles(_:settings:)`, qui se charge de la résolution du
+    /// contexte, du dédoublonnage et du calcul du dossier de sortie pour
+    /// chacun. Racine du dossier uniquement, pas de sous-dossiers.
+    func scanFolder(_ folder: URL, settings: AppSettings) {
         let audioExtensions: Set<String> = ["wav", "mp3", "m4a", "aac", "aif", "aiff", "caf", "mp4"]
         let entries = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
         let audioFiles = entries
             .filter { audioExtensions.contains($0.pathExtension.lowercased()) }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        addFiles(audioFiles, settings: settings)
+    }
+
+    /// Ajoute des fichiers audio à la file — depuis un scan de dossier
+    /// complet (`scanFolder`) ou depuis une sélection ponctuelle de
+    /// fichiers isolés (bouton "Ajouter des fichiers…"). Pour chaque
+    /// fichier, résout son contexte/nombre de locuteurs à partir des
+    /// fichiers de contexte présents dans son propre dossier (fichier
+    /// maître "Contexte", ou fichier texte de même nom — voir
+    /// `makeJob(for:settings:)`) et ignore silencieusement les fichiers déjà
+    /// présents dans la file (dédoublonnage sur `audioURL`).
+    func addFiles(_ urls: [URL], settings: AppSettings) {
+        let newJobs = urls.compactMap { makeJob(for: $0, settings: settings) }
+        guard !newJobs.isEmpty else { return }
+        jobs.append(contentsOf: newJobs)
+        save()
+        for job in newJobs { loadDuration(for: job.id, audioURL: job.audioURL) }
+    }
+
+    /// Résout le contexte et le dossier de sortie d'un unique fichier audio.
+    ///
+    /// Priorité du contexte :
+    /// 1. Fichier maître "Contexte" (nom sans extension, insensible à la
+    ///    casse — couvre `Contexte`, `Contexte.txt`, `contexte.txt`), dans
+    ///    le même dossier que l'audio : si son contenu contient des blocs
+    ///    séparés par une ligne vide dont la première ligne correspond au
+    ///    nom exact de cet audio, ce bloc sert de contexte spécifique.
+    ///    Dans ce bloc, une ligne du type "Locuteurs: 5" (voir
+    ///    `parseSpeakerCount`) est extraite comme nombre de locuteurs et
+    ///    retirée du texte de contexte. Si aucun bloc ne correspond (texte
+    ///    libre sans en-tête reconnu), tout le contenu sert de contexte
+    ///    commun (comportement historique de `contexte.txt`).
+    /// 2. Fichier texte de même nom que l'audio (spécifique) — concaténé
+    ///    après le contexte résolu ci-dessus si les deux existent.
+    ///
+    /// Retourne `nil` si le fichier est déjà présent dans la file.
+    private func makeJob(for audioURL: URL, settings: AppSettings) -> BatchJob? {
+        guard !jobs.contains(where: { $0.audioURL == audioURL }) else { return nil }
+
+        let folder = audioURL.deletingLastPathComponent()
+        let entries = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+
+        let normalizedName = audioURL.lastPathComponent.precomposedStringWithCanonicalMapping
+        let basename = audioURL.deletingPathExtension().lastPathComponent
+            .precomposedStringWithCanonicalMapping
 
         let masterContextURL = entries.first {
             $0.deletingPathExtension().lastPathComponent
@@ -107,52 +141,36 @@ final class BatchQueueManager: ObservableObject {
         }
         let masterContextContent = masterContextURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
         let perFileInfo = masterContextContent.map {
-            parseMultiFileBlocks(masterFileContent: $0, audioFilenames: audioFiles.map { $0.lastPathComponent })
+            parseMultiFileBlocks(masterFileContent: $0, audioFilenames: [audioURL.lastPathComponent])
         } ?? [:]
         let sharedContext = perFileInfo.isEmpty ? masterContextContent : nil
 
-        var newJobs: [BatchJob] = []
-        for audioURL in audioFiles {
-            guard !jobs.contains(where: { $0.audioURL == audioURL }) else { continue }
-
-            let normalizedName = audioURL.lastPathComponent.precomposedStringWithCanonicalMapping
-            let basename = audioURL.deletingPathExtension().lastPathComponent
-                .precomposedStringWithCanonicalMapping
-            let specificContextURL = entries.first {
-                $0.pathExtension.lowercased() == "txt"
-                    && $0.deletingPathExtension().lastPathComponent.precomposedStringWithCanonicalMapping == basename
-            }
-            let specificContext = specificContextURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
-            let matchedInfo = perFileInfo[normalizedName]
-
-            var parts: [String] = []
-            if let matchedContext = matchedInfo?.context, !matchedContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                parts.append(matchedContext.trimmingCharacters(in: .whitespacesAndNewlines))
-            } else if let sharedContext, !sharedContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                parts.append(sharedContext.trimmingCharacters(in: .whitespacesAndNewlines))
-            }
-            if let specificContext, !specificContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                parts.append(specificContext.trimmingCharacters(in: .whitespacesAndNewlines))
-            }
-
-            let outputFolder = audioURL.deletingLastPathComponent()
-                .appendingPathComponent("sortie_\(audioURL.deletingPathExtension().lastPathComponent)")
-
-            newJobs.append(
-                BatchJob(
-                    id: UUID(),
-                    audioURL: audioURL,
-                    status: .pending,
-                    outputFolder: outputFolder,
-                    context: parts.isEmpty ? nil : parts.joined(separator: "\n\n"),
-                    numSpeakers: matchedInfo?.numSpeakers,
-                    errorMessage: nil
-                )
-            )
+        let specificContextURL = entries.first {
+            $0.pathExtension.lowercased() == "txt"
+                && $0.deletingPathExtension().lastPathComponent.precomposedStringWithCanonicalMapping == basename
         }
-        jobs.append(contentsOf: newJobs)
-        save()
-        for job in newJobs { loadDuration(for: job.id, audioURL: job.audioURL) }
+        let specificContext = specificContextURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+        let matchedInfo = perFileInfo[normalizedName]
+
+        var parts: [String] = []
+        if let matchedContext = matchedInfo?.context, !matchedContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append(matchedContext.trimmingCharacters(in: .whitespacesAndNewlines))
+        } else if let sharedContext, !sharedContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append(sharedContext.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        if let specificContext, !specificContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append(specificContext.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        return BatchJob(
+            id: UUID(),
+            audioURL: audioURL,
+            status: .pending,
+            outputFolder: settings.outputFolder(for: audioURL),
+            context: parts.isEmpty ? nil : parts.joined(separator: "\n\n"),
+            numSpeakers: matchedInfo?.numSpeakers,
+            errorMessage: nil
+        )
     }
 
     /// Charge la durée de l'audio en arrière-plan (lecture asynchrone

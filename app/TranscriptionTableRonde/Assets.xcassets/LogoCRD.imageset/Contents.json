@@ -1,0 +1,40 @@
+{
+  "images": [
+    {
+      "filename": "LogoCRD_clair.png",
+      "idiom": "universal",
+      "scale": "1x"
+    },
+    {
+      "filename": "LogoCRD_sombre.png",
+      "idiom": "universal",
+      "scale": "1x",
+      "appearances": [
+        {
+          "appearance": "luminosity",
+          "value": "dark"
+        }
+      ]
+    },
+    {
+      "filename": "LogoCRD_clair@2x.png",
+      "idiom": "universal",
+      "scale": "2x"
+    },
+    {
+      "filename": "LogoCRD_sombre@2x.png",
+      "idiom": "universal",
+      "scale": "2x",
+      "appearances": [
+        {
+          "appearance": "luminosity",
+          "value": "dark"
+        }
+      ]
+    }
+  ],
+  "info": {
+    "author": "xcode",
+    "version": 1
+  }
+}

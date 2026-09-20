@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 /// Affiche l'avancement d'un job en cours. Vue séparée avec son propre
 /// `@ObservedObject` sur le `PipelineRunner` du job actif : nécessaire pour
@@ -41,7 +42,7 @@ struct BatchQueueView: View {
             Divider()
             if queue.jobs.isEmpty {
                 Spacer()
-                Text("Choisissez un dossier contenant des fichiers audio pour commencer.")
+                Text("Choisissez un dossier ou ajoutez des fichiers audio pour commencer.")
                     .foregroundStyle(.secondary)
                 Spacer()
             } else {
@@ -74,6 +75,9 @@ struct BatchQueueView: View {
                 Spacer()
                 Button("Choisir un dossier…") {
                     chooseFolder()
+                }
+                Button("Ajouter des fichiers…") {
+                    addFiles()
                 }
                 Button(queue.isActive ? "Mettre en pause" : "Démarrer") {
                     if queue.isActive {
@@ -239,8 +243,28 @@ struct BatchQueueView: View {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.message = "Choisissez le dossier contenant les enregistrements à traiter"
+        if !settings.recordingsFolder.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: settings.recordingsFolder, isDirectory: true)
+        }
         guard panel.runModal() == .OK, let folder = panel.url else { return }
-        queue.scanFolder(folder)
+        queue.scanFolder(folder, settings: settings)
+    }
+
+    /// Ajoute des fichiers audio choisis un par un (ou plusieurs à la fois),
+    /// sans avoir à resélectionner tout un dossier — complément de
+    /// "Choisir un dossier…" pour compléter une file déjà en cours.
+    private func addFiles() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.audio]
+        panel.message = "Choisissez un ou plusieurs fichiers audio à ajouter à la file"
+        if !settings.recordingsFolder.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: settings.recordingsFolder, isDirectory: true)
+        }
+        guard panel.runModal() == .OK else { return }
+        queue.addFiles(panel.urls, settings: settings)
     }
 
     private func openReview(_ job: BatchJob) {

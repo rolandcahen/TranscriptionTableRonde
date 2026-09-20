@@ -14,13 +14,38 @@ struct TranscriptionTableRondeApp: App {
     // "batchQueue" pilote toujours le même état : aucun traitement en double
     // possible, quel que soit le nombre de fenêtres ouvertes.
     @StateObject private var batchQueue = BatchQueueManager()
+    // Même raisonnement pour la session "fichier unique" : une seule
+    // instance persistée au niveau de l'app, pour que la fenêtre principale
+    // retrouve toujours le même état sauvegardé, quel que soit le nombre de
+    // fois où elle est ouverte/fermée.
+    @StateObject private var singleSession = SingleSessionStore()
+
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(settings)
                 .environmentObject(batchQueue)
-                .frame(minWidth: 640, minHeight: 560)
+                .environmentObject(singleSession)
+                // 760 et non 640 : le bandeau de signatures occupe 277 pt à
+                // droite du titre, et en dessous de cette largeur il
+                // viendrait chevaucher le sous-titre.
+                .frame(minWidth: 760, minHeight: 560)
+        }
+        .windowResizability(.contentSize)
+        .commands {
+            // Remplace le panneau « À propos » standard par notre fenêtre,
+            // qui porte les signatures institutionnelles et la notice.
+            CommandGroup(replacing: .appInfo) {
+                Button("À propos de Transcription table ronde") {
+                    openWindow(id: "about")
+                }
+            }
+        }
+
+        Window("À propos de Transcription table ronde", id: "about") {
+            AboutView()
         }
         .windowResizability(.contentSize)
 

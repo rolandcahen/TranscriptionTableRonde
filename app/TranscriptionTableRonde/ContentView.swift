@@ -5,6 +5,11 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @EnvironmentObject private var settings: AppSettings
     @EnvironmentObject private var batchQueue: BatchQueueManager
+    // Session persistée de cette fenêtre (fichier, contexte, nombre de
+    // locuteurs...) — voir SingleSessionStore.swift. Sans ça, tout est
+    // ré-saisi à chaque relance de l'app puisque les @State ci-dessous sont
+    // volatiles.
+    @EnvironmentObject private var sessionStore: SingleSessionStore
     @StateObject private var runner = PipelineRunner()
     @StateObject private var summaryRunner = SummaryRunner()
     @Environment(\.openSettings) private var openSettings
@@ -16,6 +21,17 @@ struct ContentView: View {
     @State private var sessionError: String?
     @State private var categoriesText: String = ContentView.defaultCategoriesText
     @State private var contextText: String = ""
+    // Message affiché quand une session a été interrompue (app quittée ou
+    // plantée en plein traitement) et retrouvée au lancement — invite juste
+    // à relancer, plutôt que de prétendre à tort que le traitement est
+    // terminé.
+    @State private var resumeBanner: String?
+    // Vrai tant qu'une session interrompue retrouvée au lancement n'a pas
+    // été traitée (relancée ou remplacée) : sans ce drapeau, la simple
+    // restauration des champs réenregistrerait la session en "notStarted"
+    // et le message disparaîtrait dès le lancement suivant, même sans que
+    // la transcription ait été relancée.
+    @State private var interruptedRun = false
 
     static let defaultCategoriesText = """
     État de la recherche
@@ -76,6 +92,12 @@ struct ContentView: View {
                     .font(.callout)
             }
 
+            if let resumeBanner {
+                Label(resumeBanner, systemImage: "arrow.clockwise.circle")
+                    .foregroundStyle(.blue)
+                    .font(.callout)
+            }
+
             if runner.state == .running {
                 progressView
             }
@@ -99,7 +121,13 @@ struct ContentView: View {
             // présente au lancement —, plutôt que de dépendre de
             // l'ouverture de la fenêtre "Traitement par lots".
             batchQueue.resumeIfNeeded(settings: settings)
+            restoreSingleSession()
         }
+        .onChange(of: audioURL) { _, _ in persistSession(status: currentStatus()) }
+        .onChange(of: numSpeakersText) { _, _ in persistSession(status: currentStatus()) }
+        .onChange(of: contextText) { _, _ in persistSession(status: currentStatus()) }
+        .onChange(of: categoriesText) { _, _ in persistSession(status: currentStatus()) }
+        .onChange(of: runner.state) { _, _ in persistSession(status: currentStatus()) }
         .alert("Session introuvable", isPresented: Binding(
             get: { sessionError != nil },
             set: { if !$0 { sessionError = nil } }
@@ -155,12 +183,21 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Transcription table ronde")
-                .font(.title2).bold()
-            Text("Transcription et diarisation 100 % locales (mlx-whisper + pyannote)")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Transcription table ronde")
+                    .font(.title2).bold()
+                Text("Transcription et diarisation 100 % locales (mlx-whisper + pyannote)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 12)
+            // Signatures institutionnelles, justifiées à droite (voir
+            // AboutView.swift). C'est ce bandeau qui impose la largeur
+            // minimale de la fenêtre, relevée en conséquence dans
+            // TranscriptionTableRondeApp.swift.
+            SignaturesView()
         }
     }
 
@@ -334,22 +371,97 @@ struct ContentView: View {
         findEntry(in: folder) { $0.lastPathComponent.hasSuffix(suffix) }
     }
 
+    /// Restaure l'état de la fenêtre à partir de la dernière session
+    /// enregistrée (voir `SingleSessionStore`) : fichier, contexte, nombre
+    /// de locuteurs et catégories de résumé, sans que l'utilisateur ait à
+    /// tout ressaisir après un redémarrage de l'app.
+    ///
+    /// - Si la session était terminée avec succès, retrouve directement le
+    ///   dossier de sortie (comme `openExistingSession()`, mais
+    ///   automatiquement, sans resélection manuelle du fichier).
+    /// - Si elle était en cours (app quittée ou plantée en plein
+    ///   traitement), affiche un message plutôt que de prétendre à tort que
+    ///   le traitement est terminé : l'utilisateur relance lui-même avec
+    ///   "Transcrire".
+    private func restoreSingleSession() {
+        guard let state = sessionStore.lastState else { return }
+        audioURL = state.audioURL
+        numSpeakersText = state.numSpeakersText
+        contextText = state.contextText
+        if !state.categoriesText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            categoriesText = state.categoriesText
+        }
+
+        switch state.status {
+        case .finished:
+            if let outputFolder = state.outputFolder,
+               findFile(in: outputFolder, suffix: "_transcript.json") != nil {
+                runner.outputFolder = outputFolder
+                runner.state = .finished(success: true)
+            }
+        case .running:
+            interruptedRun = true
+            resumeBanner = "Une transcription a été interrompue pour « \(state.audioURL?.lastPathComponent ?? "ce fichier") ». Relancez-la avec Transcrire."
+        case .notStarted:
+            break
+        }
+    }
+
+    /// Statut courant à enregistrer, déduit de l'état du `runner` : un
+    /// échec redevient "notStarted" (les champs restent conservés, mais on
+    /// ne veut pas afficher au prochain lancement un message "session
+    /// interrompue" pour un traitement qui a simplement échoué proprement).
+    /// Une session interrompue non encore relancée (`interruptedRun`) reste
+    /// marquée "running" tant que l'utilisateur n'a rien fait, pour que le
+    /// message réapparaisse au lancement suivant.
+    private func currentStatus() -> SingleSessionStatus {
+        switch runner.state {
+        case .running: return .running
+        case .finished(let success): return success ? .finished : .notStarted
+        default: return interruptedRun ? .running : .notStarted
+        }
+    }
+
+    private func persistSession(status: SingleSessionStatus) {
+        sessionStore.save(SingleSessionState(
+            audioURL: audioURL,
+            outputFolder: runner.outputFolder,
+            numSpeakersText: numSpeakersText,
+            contextText: contextText,
+            categoriesText: categoriesText,
+            status: status
+        ))
+    }
+
     private func openExistingSession() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.audio]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.message = "Choisissez le fichier audio d'une session déjà traitée"
+        if !settings.recordingsFolder.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: settings.recordingsFolder, isDirectory: true)
+        }
         guard panel.runModal() == .OK, let selected = panel.url else { return }
 
-        let parent = selected.deletingLastPathComponent()
         let basename = selected.deletingPathExtension().lastPathComponent
         let expectedFolderName = "sortie_\(basename)".precomposedStringWithCanonicalMapping
 
-        guard let outputFolder = findEntry(in: parent, matching: {
-            $0.hasDirectoryPath && $0.lastPathComponent.precomposedStringWithCanonicalMapping == expectedFolderName
-        }) else {
-            sessionError = "Aucun dossier de sortie trouvé pour ce fichier.\nAttendu : « sortie_\(basename) » à côté de l'audio."
+        // Cherche le dossier de sortie là où il serait écrit aujourd'hui
+        // (dossier de sauvegarde configuré, ou à côté de l'audio), puis, à
+        // défaut, à côté de l'audio : une session traitée avant que le
+        // dossier de sauvegarde ne soit configuré reste ainsi ouvrable.
+        let candidateParents = [
+            settings.outputFolder(for: selected).deletingLastPathComponent(),
+            selected.deletingLastPathComponent()
+        ]
+
+        guard let outputFolder = candidateParents.compactMap({ parent in
+            findEntry(in: parent, matching: {
+                $0.hasDirectoryPath && $0.lastPathComponent.precomposedStringWithCanonicalMapping == expectedFolderName
+            })
+        }).first else {
+            sessionError = "Aucun dossier de sortie trouvé pour ce fichier.\nAttendu : « sortie_\(basename) » dans le dossier de sauvegarde ou à côté de l'audio."
             return
         }
 
@@ -367,6 +479,10 @@ struct ContentView: View {
            let text = try? String(contentsOf: contextFile, encoding: .utf8) {
             contextText = text
         }
+
+        resumeBanner = nil
+        interruptedRun = false
+        persistSession(status: .finished)
     }
 
     /// Ramène la fenêtre "Traitement par lots" au premier plan si elle est
@@ -429,6 +545,9 @@ struct ContentView: View {
         panel.allowedContentTypes = [.audio]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
+        if !settings.recordingsFolder.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: settings.recordingsFolder, isDirectory: true)
+        }
         if panel.runModal() == .OK {
             audioURL = panel.url
         }
@@ -448,9 +567,10 @@ struct ContentView: View {
 
     private func startRun() {
         guard let audioURL else { return }
+        resumeBanner = nil
+        interruptedRun = false
         let numSpeakers = Int(numSpeakersText.trimmingCharacters(in: .whitespaces))
-        let outputFolder = audioURL.deletingLastPathComponent()
-            .appendingPathComponent("sortie_\(audioURL.deletingPathExtension().lastPathComponent)")
+        let outputFolder = settings.outputFolder(for: audioURL)
         try? FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
         runner.run(audioURL: audioURL, settings: settings, numSpeakers: numSpeakers, outputFolder: outputFolder, context: contextText)
     }
