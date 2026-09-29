@@ -14,3 +14,6 @@ pipeline/__pycache__/
 
 # Compilation temporaire (script d installation)
 app/.build_tmp/
+
+# Dossier de telechargement de l app Claude
+Claude outputs/
