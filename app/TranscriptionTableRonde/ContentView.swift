@@ -151,7 +151,7 @@ struct ContentView: View {
                 } label: {
                     Image(systemName: "clock.arrow.circlepath")
                 }
-                .help("Ouvrir une session déjà traitée (sans refaire la transcription)")
+                .help("Ouvrir une session déjà traitée : choisissez son dossier « sortie_… », un fichier qu'il contient, ou l'enregistrement d'origine.")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -433,56 +433,200 @@ struct ContentView: View {
         ))
     }
 
+    /// Ouvre une session déjà transcrite et diarisée.
+    ///
+    /// Trois gestes sont acceptés, parce qu'aucun n'est plus naturel que
+    /// les autres du point de vue de l'utilisateur : le dossier de sortie
+    /// « sortie_… », n'importe quel fichier qu'il contient — y compris
+    /// l'audio de relecture, confusion inévitable puisque c'est le seul
+    /// fichier audio visible dans ce dossier —, ou l'enregistrement
+    /// d'origine. Auparavant seul le dernier fonctionnait, et le sélecteur
+    /// grisait tout le reste sans expliquer pourquoi.
     private func openExistingSession() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.audio]
         panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.message = "Choisissez le fichier audio d'une session déjà traitée"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.message = "Choisissez un dossier « sortie_… », un fichier qu'il contient, ou l'enregistrement d'origine"
+        panel.prompt = "Ouvrir la session"
         if !settings.recordingsFolder.isEmpty {
             panel.directoryURL = URL(fileURLWithPath: settings.recordingsFolder, isDirectory: true)
         }
         guard panel.runModal() == .OK, let selected = panel.url else { return }
 
-        let basename = selected.deletingPathExtension().lastPathComponent
-        let expectedFolderName = "sortie_\(basename)".precomposedStringWithCanonicalMapping
+        guard let dossierDeSortie = resoudreDossierDeSortie(depuis: selected) else {
+            sessionError = "Aucune session trouvée à partir de « \(selected.lastPathComponent) ».\n\n"
+                + "Choisissez le dossier « sortie_… » d'un enregistrement déjà transcrit, "
+                + "un fichier qu'il contient, ou l'enregistrement audio d'origine."
+            return
+        }
 
-        // Cherche le dossier de sortie là où il serait écrit aujourd'hui
-        // (dossier de sauvegarde configuré, ou à côté de l'audio), puis, à
-        // défaut, à côté de l'audio : une session traitée avant que le
-        // dossier de sauvegarde ne soit configuré reste ainsi ouvrable.
-        let candidateParents = [
-            settings.outputFolder(for: selected).deletingLastPathComponent(),
-            selected.deletingLastPathComponent()
+        guard findFile(in: dossierDeSortie, suffix: "_transcript.json") != nil else {
+            sessionError = "Le dossier « \(dossierDeSortie.lastPathComponent) » ne contient pas de transcript."
+            return
+        }
+
+        chargerSession(dossierDeSortie: dossierDeSortie)
+    }
+
+    /// Retrouve le dossier de sortie à partir de ce que l'utilisateur a
+    /// désigné, quel que soit son geste.
+    private func resoudreDossierDeSortie(depuis selection: URL) -> URL? {
+        // Un dossier contenant déjà un transcript : c'est lui.
+        if selection.hasDirectoryPath, findFile(in: selection, suffix: "_transcript.json") != nil {
+            return selection
+        }
+        // Un fichier pris dans un dossier de sortie : c'est son parent.
+        if !selection.hasDirectoryPath {
+            let parent = selection.deletingLastPathComponent()
+            if findFile(in: parent, suffix: "_transcript.json") != nil {
+                return parent
+            }
+        }
+        // Un enregistrement d'origine : on cherche son dossier « sortie_… »,
+        // dans le dossier de sauvegarde configuré puis à côté de l'audio.
+        let basename = selection.deletingPathExtension().lastPathComponent
+        let attendu = "sortie_\(basename)".precomposedStringWithCanonicalMapping
+        let parentsCandidats = [
+            settings.outputFolder(for: selection).deletingLastPathComponent(),
+            selection.deletingLastPathComponent()
         ]
-
-        guard let outputFolder = candidateParents.compactMap({ parent in
+        return parentsCandidats.compactMap { parent in
             findEntry(in: parent, matching: {
-                $0.hasDirectoryPath && $0.lastPathComponent.precomposedStringWithCanonicalMapping == expectedFolderName
+                $0.hasDirectoryPath && $0.lastPathComponent.precomposedStringWithCanonicalMapping == attendu
             })
-        }).first else {
-            sessionError = "Aucun dossier de sortie trouvé pour ce fichier.\nAttendu : « sortie_\(basename) » dans le dossier de sauvegarde ou à côté de l'audio."
-            return
-        }
+        }.first
+    }
 
-        guard findFile(in: outputFolder, suffix: "_transcript.json") != nil else {
-            sessionError = "Le dossier « \(outputFolder.lastPathComponent) » ne contient pas de transcript."
-            return
-        }
+    /// Installe une session complète dans l'interface : l'audio, le
+    /// contexte et l'état du traitement remplacent intégralement ceux de la
+    /// session précédente, plutôt que de s'y superposer.
+    private func chargerSession(dossierDeSortie: URL) {
+        let basename = nomDeBase(dossierDeSortie: dossierDeSortie)
 
-        audioURL = selected
-        runner.logLines = []
-        runner.outputFolder = outputFolder
+        let audio = audioDeLaSession(dossierDeSortie: dossierDeSortie, basename: basename)
+        audioURL = audio
+        runner.outputFolder = dossierDeSortie
         runner.state = .finished(success: true)
+        resumerSession(dossierDeSortie: dossierDeSortie, audio: audio)
 
-        if let contextFile = findFile(in: outputFolder, suffix: "_contexte.txt"),
+        if audio == nil {
+            sessionError = "La session « \(dossierDeSortie.lastPathComponent) » est ouverte, "
+                + "mais aucun fichier audio n'a été trouvé, ni dans ce dossier, ni à côté, "
+                + "ni dans le dossier d'enregistrements. La vérification a besoin de l'audio : "
+                + "replacez l'enregistrement dans le dossier de sortie, ou indiquez son "
+                + "emplacement dans les Réglages."
+        }
+
+        if let contextFile = findFile(in: dossierDeSortie, suffix: "_contexte.txt"),
            let text = try? String(contentsOf: contextFile, encoding: .utf8) {
             contextText = text
+        } else {
+            contextText = ""
         }
+        numSpeakersText = ""
 
         resumeBanner = nil
         interruptedRun = false
         persistSession(status: .finished)
+    }
+
+    /// Nom de base de la session, déduit du transcript plutôt que du nom du
+    /// dossier : c'est le transcript qui fait foi pour retrouver les autres
+    /// fichiers, même si le dossier a été renommé.
+    private func nomDeBase(dossierDeSortie: URL) -> String {
+        if let transcript = findFile(in: dossierDeSortie, suffix: "_transcript.json") {
+            var nom = transcript.deletingPathExtension().lastPathComponent
+            if nom.hasSuffix("_transcript") { nom.removeLast("_transcript".count) }
+            return nom
+        }
+        var nom = dossierDeSortie.lastPathComponent
+        if nom.hasPrefix("sortie_") { nom.removeFirst("sortie_".count) }
+        return nom
+    }
+
+    /// Audio de la session : l'enregistrement d'origine s'il est encore là,
+    /// sinon l'audio de relecture conservé dans le dossier de sortie. Ce
+    /// dernier suffit à la vérification — c'est d'ailleurs celui que la
+    /// fenêtre de correction lit en priorité —, ce qui permet d'ouvrir une
+    /// session reçue d'un collègue sans l'enregistrement d'origine.
+    /// Audio de la session, cherché dans cet ordre : le dossier de sortie
+    /// lui-même, le dossier qui le contient, le dossier d'enregistrements
+    /// configuré, puis, à défaut, l'audio de relecture.
+    ///
+    /// Le dossier de sortie vient en premier parce que c'est le cas le plus
+    /// fréquent en pratique : on transcrit un enregistrement déjà rangé
+    /// dans son propre dossier, et le WAV se retrouve à côté du transcript.
+    /// C'était précisément le seul endroit où cette recherche n'allait pas
+    /// voir, si bien que la session s'ouvrait sans son audio — et donc sans
+    /// le bouton « Vérifier / corriger », qui en dépend.
+    private func audioDeLaSession(dossierDeSortie: URL, basename: String) -> URL? {
+        let extensionsAudio: Set<String> = ["wav", "mp3", "m4a", "aac", "aif", "aiff", "caf", "mp4"]
+        let normalise = basename.precomposedStringWithCanonicalMapping
+
+        let estAudio: (URL) -> Bool = { url in
+            !url.hasDirectoryPath && extensionsAudio.contains(url.pathExtension.lowercased())
+        }
+        let estAudioDeRelecture: (URL) -> Bool = {
+            $0.lastPathComponent.hasSuffix("_review_audio.wav")
+        }
+        let porteLeNom: (URL) -> Bool = { url in
+            url.deletingPathExtension().lastPathComponent.precomposedStringWithCanonicalMapping == normalise
+        }
+        let correspond: (URL) -> Bool = { estAudio($0) && porteLeNom($0) }
+
+        var dossiers = [dossierDeSortie, dossierDeSortie.deletingLastPathComponent()]
+        if !settings.recordingsFolder.isEmpty {
+            dossiers.append(URL(fileURLWithPath: settings.recordingsFolder, isDirectory: true))
+        }
+        for dossier in dossiers {
+            if let audio = findEntry(in: dossier, matching: correspond) { return audio }
+        }
+
+        // Enregistrement renommé depuis la transcription : on prend le seul
+        // autre audio du dossier, l'audio de relecture mis à part.
+        if let audio = findEntry(in: dossierDeSortie, matching: { estAudio($0) && !estAudioDeRelecture($0) }) {
+            return audio
+        }
+        return findFile(in: dossierDeSortie, suffix: "_review_audio.wav")
+    }
+
+    /// Récapitule dans le journal ce qui vient d'être chargé. Sans cela, le
+    /// grand cadre central reste vide après l'ouverture d'une session et
+    /// rien n'indique ce que l'application a réellement trouvé.
+    private func resumerSession(dossierDeSortie: URL, audio: URL?) {
+        var lignes = ["Session ouverte : \(dossierDeSortie.lastPathComponent)"]
+
+        if let transcript = findFile(in: dossierDeSortie, suffix: "_transcript.json"),
+           let data = try? Data(contentsOf: transcript),
+           let segments = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            let locuteurs = Set(segments.compactMap { $0["speaker"] as? String })
+            lignes.append("\(segments.count) segment(s), \(locuteurs.count) locuteur(s)")
+        }
+
+        lignes.append("Audio : \(audio?.lastPathComponent ?? "introuvable")")
+
+        let connus: [(String, String)] = [
+            ("_transcript.json", "transcript"),
+            ("_transcript.txt", "transcript lisible"),
+            ("_final.txt", "version corrigée"),
+            ("_speakers.json", "fiche locuteurs"),
+            ("_whisper_raw.json", "cache de transcription"),
+            ("_contexte.txt", "contexte"),
+            ("_review_audio.wav", "audio de relecture"),
+        ]
+        let presents = connus.filter { findFile(in: dossierDeSortie, suffix: $0.0) != nil }
+        if !presents.isEmpty {
+            lignes.append("Fichiers : " + presents.map { $0.1 }.joined(separator: ", "))
+        }
+
+        if audio == nil {
+            lignes.append("Aucun audio trouvé : la vérification et la relecture sont indisponibles.")
+        } else {
+            lignes.append("« Vérifier / corriger » reprend les corrections là où elles en sont.")
+        }
+
+        runner.logLines = lignes
     }
 
     /// Ramène la fenêtre "Traitement par lots" au premier plan si elle est

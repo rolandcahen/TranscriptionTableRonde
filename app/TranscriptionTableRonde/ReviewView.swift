@@ -62,6 +62,19 @@ struct ReviewView: View {
     @State private var isPreparingAudio = false
     @State private var audioPrepWarning: String?
 
+    // Pile d'annulation des modifications destructives (suppression,
+    // division, fusion de locuteurs, ajout). Le travail de correction est
+    // long et l'interface bouge sous le curseur au fil de la lecture : un
+    // clic malencontreux sur la corbeille ne doit pas être définitif,
+    // d'autant que l'enregistrement écrase le transcript sur place.
+    @State private var undoStack: [[EditableSegment]] = []
+
+    // Empreinte du contenu au dernier enregistrement. Comparée à
+    // l'empreinte courante, elle dit si la session est modifiée — y compris
+    // après une annulation qui ramène au contenu d'origine, cas qu'un
+    // simple drapeau « modifié » traiterait à tort comme un changement.
+    @State private var empreinteEnregistree: Int = 0
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
@@ -84,14 +97,17 @@ struct ReviewView: View {
         .padding(16)
         .frame(minWidth: 760, minHeight: 560)
         .navigationTitle("Vérification — \(target.audioURL.lastPathComponent)")
-        .onAppear {
-            load()
-            setupPlayer()
-            loadContextNameCandidates()
+        // .task(id:) et non .onAppear : quand on ouvre une autre session,
+        // SwiftUI réutilise la fenêtre déjà ouverte en changeant seulement
+        // `target`. .onAppear ne se redéclenchait alors pas — le titre,
+        // recalculé à chaque rendu, affichait le nouveau fichier pendant
+        // que les segments restaient ceux du précédent. .task(id:) relance
+        // le chargement à chaque changement de cible.
+        .task(id: target) {
+            chargerCible()
         }
         .onDisappear {
-            if let timeObserver { player?.removeTimeObserver(timeObserver) }
-            player?.pause()
+            arreterLecteur()
         }
     }
 
@@ -120,10 +136,32 @@ struct ReviewView: View {
             } label: {
                 Label("Ajouter un segment", systemImage: "plus")
             }
-            Button("Enregistrer") {
+            Button {
+                annulerDerniereModification()
+            } label: {
+                Label("Annuler", systemImage: "arrow.uturn.backward")
+            }
+            .keyboardShortcut("z", modifiers: .command)
+            .disabled(undoStack.isEmpty)
+            .help("Annule la dernière suppression, division, fusion ou ajout de segment.")
+            Button {
+                exporterCSV()
+            } label: {
+                Label("Exporter CSV", systemImage: "tablecells")
+            }
+            .help("Écrit un fichier CSV à côté du transcript : locuteur, début, fin, durée, texte, plus des colonnes vides pour le codage.")
+            Button {
                 save()
+            } label: {
+                Label(modifie ? "Enregistrer" : "Enregistré",
+                      systemImage: modifie ? "exclamationmark.circle.fill" : "checkmark.circle")
             }
             .keyboardShortcut("s", modifiers: .command)
+            .buttonStyle(.borderedProminent)
+            .tint(modifie ? .red : .gray)
+            .help(modifie
+                  ? "Des corrections ne sont pas encore écrites sur le disque."
+                  : "Tout est enregistré.")
         }
         .overlay(alignment: .bottom) {
             if let saveMessage {
@@ -273,6 +311,7 @@ struct ReviewView: View {
     /// faisait partie ; sinon il disparaît naturellement puisque plus aucun
     /// segment ne le référence).
     private func mergeSpeaker(_ speakerID: String, into target: String) {
+        memoriserPourAnnulation()
         for index in segments.indices where segments[index].speakerID == speakerID {
             segments[index].speakerID = target
         }
@@ -345,13 +384,12 @@ struct ReviewView: View {
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Button {
-                    seek(to: s.start)
-                    player?.play()
-                    isPlaying = true
+                    basculerLecture(s)
                 } label: {
-                    Image(systemName: "play.circle")
+                    Image(systemName: lit(s) ? "stop.circle.fill" : "play.circle")
                 }
                 .buttonStyle(.plain)
+                .help(lit(s) ? "Arrêter" : "Lire ce segment")
 
                 TextField("début", text: timestampBinding(segment.start))
                     .font(.system(.caption, design: .monospaced))
@@ -369,10 +407,20 @@ struct ReviewView: View {
                 .pickerStyle(.menu)
                 .frame(width: 160)
 
+                Text(confianceTexte(s))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(confianceTeinte(s))
+                    .help("Confiance moyenne du modèle sur ce segment. Ce n'est pas un taux d'exactitude : elle sert à repérer les passages à relire en priorité.")
+
                 if isFlagged(s) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                        .help(flagReason(s))
+                    HStack(spacing: 3) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text(flagReason(s))
+                            .font(.caption2)
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(.orange)
+                    .help("Segment signalé : \(flagReason(s)). À vérifier en priorité.")
                 }
                 Spacer()
                 if s.text.contains(Self.speakerSplitMarker) {
@@ -392,12 +440,29 @@ struct ReviewView: View {
                 .buttonStyle(.plain)
             }
 
-            TextEditor(text: segment.text)
-                .font(.system(.body))
-                .frame(minHeight: 40)
-                .padding(4)
-                .background(confidenceColor(s.avgLogprob))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+            // Cartouche à la hauteur du texte, sans défilement interne.
+            //
+            // Un TextEditor ne se dimensionne pas sur son contenu : à
+            // hauteur fixe, un segment long devenait une fenêtre de trois
+            // lignes dans laquelle il fallait faire défiler pour lire et
+            // corriger. On superpose donc, dans un ZStack, un Text invisible
+            // portant le même contenu, la même police et les mêmes marges :
+            // c'est lui qui, par sa hauteur naturelle de texte replié,
+            // impose la hauteur de la pile — le TextEditor s'y ajuste.
+            ZStack(alignment: .topLeading) {
+                Text(s.text.isEmpty ? " " : s.text)
+                    .font(.system(.body))
+                    .padding(EdgeInsets(top: 9, leading: 9, bottom: 9, trailing: 9))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .opacity(0)
+                    .accessibilityHidden(true)
+                TextEditor(text: segment.text)
+                    .font(.system(.body))
+                    .scrollDisabled(true)
+                    .padding(4)
+            }
+            .background(confidenceColor(s.avgLogprob))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
         }
         .padding(8)
         .background(isCurrent ? Color.accentColor.opacity(0.15) : Color(nsColor: .controlBackgroundColor))
@@ -428,6 +493,7 @@ struct ReviewView: View {
     // MARK: - Ajout / suppression de segments
 
     private func addSegment() {
+        memoriserPourAnnulation()
         let speaker = allSpeakerIDs.first ?? "SPEAKER_00"
         let newSegment = EditableSegment(
             start: currentTime,
@@ -442,7 +508,42 @@ struct ReviewView: View {
     }
 
     private func deleteSegment(_ id: UUID) {
+        memoriserPourAnnulation()
         segments.removeAll { $0.id == id }
+    }
+
+    /// Empile l'état courant avant toute modification destructive.
+    /// Profondeur bornée : il s'agit de rattraper un clic malheureux, pas
+    /// de rejouer une séance entière de correction.
+    private func memoriserPourAnnulation() {
+        undoStack.append(segments)
+        if undoStack.count > 30 { undoStack.removeFirst() }
+        saveMessage = nil
+    }
+
+    private func annulerDerniereModification() {
+        guard let precedent = undoStack.popLast() else { return }
+        segments = precedent
+        saveMessage = "Modification annulée."
+    }
+
+    /// Vrai si la lecture est en cours et que la tête de lecture se trouve
+    /// dans ce segment.
+    private func lit(_ segment: EditableSegment) -> Bool {
+        isPlaying && currentTime >= segment.start && currentTime < segment.end
+    }
+
+    /// Le bouton de chaque segment fonctionne en bascule : s'il joue déjà
+    /// ce segment, il arrête ; sinon il s'y positionne et démarre.
+    private func basculerLecture(_ segment: EditableSegment) {
+        if lit(segment) {
+            player?.pause()
+            isPlaying = false
+        } else {
+            seek(to: segment.start)
+            player?.play()
+            isPlaying = true
+        }
     }
 
     // MARK: - Division au marqueur de locuteur
@@ -459,6 +560,7 @@ struct ReviewView: View {
     /// réattribuer ensuite via le menu de chaque nouveau segment.
     private func splitSegment(_ id: UUID) {
         guard let index = segments.firstIndex(where: { $0.id == id }) else { return }
+        memoriserPourAnnulation()
         let original = segments[index]
         let parts = original.text
             .components(separatedBy: Self.speakerSplitMarker)
@@ -493,6 +595,59 @@ struct ReviewView: View {
     }
 
     // MARK: - Confiance et signaux heuristiques
+
+    /// Confiance du modèle sur ce segment, en probabilité moyenne par jeton.
+    ///
+    /// Whisper fournit `avg_logprob`, la moyenne des logarithmes des
+    /// probabilités attribuées à chaque jeton. Son exponentielle redonne un
+    /// nombre entre 0 et 1, lisible en pourcentage et comparable d'un
+    /// segment à l'autre.
+    ///
+    /// À ne pas lire comme un taux d'exactitude : c'est la confiance que le
+    /// modèle a en lui-même, pas une mesure de justesse — un contresens peut
+    /// très bien être produit avec une confiance élevée. Sa valeur est
+    /// comparative : elle classe les segments par ordre de suspicion.
+    private func confiance(_ segment: EditableSegment) -> Double? {
+        // Un `avg_logprob` exactement nul ne sort jamais du modèle : c'est
+        // la valeur par défaut d'un segment ajouté à la main ou d'un JSON
+        // sans ce champ. Afficher « 100 % » y serait trompeur.
+        guard segment.avgLogprob != 0 else { return nil }
+        return min(1, max(0, exp(segment.avgLogprob)))
+    }
+
+    private func confianceTexte(_ segment: EditableSegment) -> String {
+        guard let valeur = confiance(segment) else { return "—" }
+        return "\(Int((valeur * 100).rounded())) %"
+    }
+
+    private func confianceTeinte(_ segment: EditableSegment) -> Color {
+        guard confiance(segment) != nil else { return .secondary }
+        if segment.avgLogprob > -0.3 { return .green }
+        if segment.avgLogprob > -0.8 { return .orange }
+        return .red
+    }
+
+    /// Empreinte de tout ce qui est éditable. Recalculée à chaque rendu :
+    /// quelques centaines de segments de texte court, c'est négligeable
+    /// devant le coût d'affichage de la liste elle-même.
+    private var empreinteEdition: Int {
+        var hasher = Hasher()
+        for segment in segments {
+            hasher.combine(segment.start)
+            hasher.combine(segment.end)
+            hasher.combine(segment.text)
+            hasher.combine(segment.speakerID)
+        }
+        for cle in speakerNames.keys.sorted() {
+            hasher.combine(cle)
+            hasher.combine(speakerNames[cle] ?? "")
+        }
+        return hasher.finalize()
+    }
+
+    private var modifie: Bool {
+        empreinteEdition != empreinteEnregistree
+    }
 
     private func confidenceColor(_ avgLogprob: Double) -> Color {
         if avgLogprob > -0.3 { return Color.green.opacity(0.12) }
@@ -637,6 +792,97 @@ struct ReviewView: View {
 
     // MARK: - Chargement / enregistrement
 
+    /// Charge, ou recharge entièrement, la fenêtre pour la cible courante.
+    /// Remet à zéro tout l'état de l'ancienne session avant de lire la
+    /// nouvelle : sans cela, des segments, des noms de locuteurs ou une
+    /// pile d'annulation du fichier précédent survivraient au changement.
+    private func chargerCible() {
+        arreterLecteur()
+        segments = []
+        speakerNames = [:]
+        manualSpeakerIDs = []
+        nextManualSpeakerNumber = 1
+        contextNameCandidates = []
+        undoStack = []
+        loadError = nil
+        saveMessage = nil
+        audioPrepWarning = nil
+        currentTime = 0
+        duration = 0
+
+        load()
+        setupPlayer()
+        loadContextNameCandidates()
+
+        // Point de référence du bouton « Enregistrer » : ce qui vient
+        // d'être lu sur le disque est, par définition, déjà enregistré.
+        empreinteEnregistree = empreinteEdition
+    }
+
+    /// Arrête la lecture et détache l'observateur de temps. Indispensable
+    /// avant de changer de cible : sans détachement, l'observateur de
+    /// l'ancien lecteur continuerait d'écrire dans `currentTime`.
+    private func arreterLecteur() {
+        if let timeObserver { player?.removeTimeObserver(timeObserver) }
+        timeObserver = nil
+        player?.pause()
+        player = nil
+        isPlaying = false
+    }
+
+    // MARK: - Export CSV
+
+    /// Écrit un CSV à côté du transcript, prêt pour le codage dans un
+    /// tableur. Point-virgule et BOM UTF-8 : sans eux, Excel en français
+    /// met toute la ligne dans une seule colonne et abîme les accents.
+    private func exporterCSV() {
+        let ordered = segments.sorted { $0.start < $1.start }
+        let colonnes = ["n", "locuteur", "debut", "fin", "debut_s", "fin_s",
+                        "duree_s", "mots", "texte", "code_1", "code_2", "code_3"]
+
+        var lignes = [colonnes.joined(separator: ";")]
+        for (n, segment) in ordered.enumerated() {
+            let texte = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let champs = [
+                String(n + 1),
+                displayName(for: segment.speakerID),
+                formatTimestamp(segment.start),
+                formatTimestamp(segment.end),
+                String(format: "%.2f", segment.start),
+                String(format: "%.2f", segment.end),
+                String(format: "%.2f", max(0, segment.end - segment.start)),
+                String(texte.split(whereSeparator: { $0.isWhitespace }).count),
+                texte,
+                "", "", "",
+            ]
+            lignes.append(champs.map(Self.echapperCSV).joined(separator: ";"))
+        }
+
+        var basename = target.transcriptURL.deletingPathExtension().lastPathComponent
+        if basename.hasSuffix("_transcript") { basename.removeLast("_transcript".count) }
+        let destination = target.transcriptURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("\(basename).csv")
+
+        let contenu = "\u{FEFF}" + lignes.joined(separator: "\r\n") + "\r\n"
+        do {
+            try contenu.write(to: destination, atomically: true, encoding: .utf8)
+            saveMessage = "CSV exporté : \(destination.lastPathComponent)"
+        } catch {
+            saveMessage = "Erreur d'export CSV : \(error.localizedDescription)"
+        }
+    }
+
+    /// Un champ contenant un point-virgule, un guillemet ou un retour à la
+    /// ligne doit être encadré de guillemets, les guillemets internes étant
+    /// doublés — sinon le tableur décale toutes les colonnes suivantes.
+    private static func echapperCSV(_ champ: String) -> String {
+        guard champ.contains(";") || champ.contains("\"") || champ.contains("\n") || champ.contains("\r") else {
+            return champ
+        }
+        return "\"" + champ.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+
     private func load() {
         guard let data = try? Data(contentsOf: target.transcriptURL),
               let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
@@ -711,6 +957,7 @@ struct ReviewView: View {
         do {
             try data.write(to: target.transcriptURL)
             try writeFinalText(ordered)
+            empreinteEnregistree = empreinteEdition
             saveMessage = "Enregistré."
         } catch {
             saveMessage = "Erreur d'enregistrement : \(error.localizedDescription)"
