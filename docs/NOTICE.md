@@ -1,7 +1,7 @@
 # Notice d'utilisation — Transcription Table Ronde
 
-*Version provisoire — 7 août 2026. Ce document sera retravaillé au fur et à
-mesure de l'évolution de l'application ; les captures d'écran seront
+*Application version 1.0 — notice mise à jour le 30 septembre 2026. Ce
+document suit l'évolution de l'application ; les captures d'écran seront
 ajoutées manuellement.*
 
 ## Sommaire
@@ -11,8 +11,9 @@ ajoutées manuellement.*
 3. [Fonctionnement général](#3-fonctionnement-général)
 4. [L'interface, fenêtre par fenêtre](#4-linterface-fenêtre-par-fenêtre)
 5. [Le résumé structuré](#5-le-résumé-structuré)
-6. [Limitations connues](#6-limitations-connues)
-7. [Glossaire](#7-glossaire)
+6. [Exporter vers un tableur](#6-exporter-vers-un-tableur)
+7. [Limitations connues](#7-limitations-connues)
+8. [Glossaire](#8-glossaire)
 
 ## 1. Présentation générale et principes
 
@@ -219,7 +220,30 @@ Dans les deux cas, le déroulement est le même pour chaque fichier :
 2. **Diarisation** — les segments de parole sont attribués à des locuteurs
    anonymes (`SPEAKER_00`, `SPEAKER_01`, …) (pyannote).
 3. **Fusion** — les deux résultats sont combinés et écrits sur disque, dans
-   un dossier `sortie_<nom du fichier>` créé à côté de l'audio.
+   un dossier `sortie_<nom du fichier>`, créé à côté de l'audio ou dans le
+   dossier de sauvegarde si vous en avez configuré un ([4.2](#42-fenêtre-réglages)).
+
+La diarisation s'exécute sur le GPU de la puce Apple quand il est
+disponible, avec repli automatique sur le processeur en cas d'échec. Sur un
+extrait de dix minutes mesuré à l'identique, le passage au GPU fait tomber
+le temps de diarisation de 409 à 28 secondes — soit 21 fois le temps réel —
+pour un découpage rigoureusement identique. Concrètement, une table ronde de
+2 h 30 se diarise en une dizaine de minutes au lieu d'une heure quarante.
+
+Pour mesurer ce gain sur votre propre machine et vos propres
+enregistrements, `pipeline/bench_diarization.py` compare plusieurs réglages
+sur un court extrait et affiche un tableau : temps, accélération, et surtout
+écart de résultat avec la configuration de référence. Le script
+`transcribe_diarize.py` accepte par ailleurs `--device cpu` si vous devez
+forcer l'ancien comportement.
+
+La transcription est écrite sur disque dès la fin de l'étape 1, dans un
+fichier `<nom>_whisper_raw.json`. Si la diarisation échoue ou si vous
+interrompez le traitement, la transcription est acquise : la relance repart
+directement à l'étape 2. Ce cache n'est réutilisé que si l'audio, le modèle,
+la langue et le contexte sont inchangés — modifier l'un d'eux refait la
+transcription. Effet utile : relancer avec un nombre de locuteurs différent
+ne recalcule que la diarisation.
 
 À partir de là, deux étapes optionnelles, dans l'ordre que l'on souhaite :
 
@@ -271,10 +295,10 @@ lui-même dans sa synthèse.
   Désactivé tant qu'aucun fichier n'est choisi ou que le token Hugging Face
   manque.
 - **Barre de progression** — indique l'étape en cours (1/3 Transcription,
-  2/3 Diarisation, 3/3 Fusion). Les étapes 1 et 2 n'affichent pas de
-  pourcentage détaillé (le moteur ne le fournit pas) : seul le spinner
-  tourne, ce qui est normal, y compris pendant plusieurs minutes sur un long
-  enregistrement.
+  2/3 Diarisation, 3/3 Fusion) avec un pourcentage pour les deux premières.
+  L'étape 2 précise en outre la phase interne de pyannote en cours
+  (segmentation de la parole, empreintes vocales, comptage des locuteurs,
+  assemblage). Seule l'étape 3, très brève, reste sans pourcentage.
 - **Journal** — sortie texte détaillée du traitement en cours, copiable via
   le bouton « Copier le journal ».
 - **Bandeau de résultat** — une fois terminé, accès direct au dossier de
@@ -290,21 +314,61 @@ Une fois la transcription terminée, une zone supplémentaire apparaît :
   modifiable selon le type de réunion (les catégories par défaut sont
   listées en section 5).
 
+**Reprise automatique au lancement** — le fichier choisi, le contexte, le
+nombre de locuteurs et les catégories du résumé sont enregistrés en continu
+et restaurés au démarrage suivant : plus rien à ressaisir après avoir quitté
+l'application. Si un traitement avait été interrompu en cours de route, un
+bandeau bleu le signale au lieu de laisser croire qu'il s'est terminé.
+
+En haut à droite du titre figurent les signatures institutionnelles du
+projet : Centre de Recherche en Design (ENSCI-Les Ateliers / ENS
+Paris-Saclay), École normale supérieure Paris-Saclay, et Comprehensive
+Sepsis Center.
+
 Barre d'outils (en haut à droite de la fenêtre), trois icônes :
 
 - 🗂️ (plateau) — ouvre la fenêtre de traitement par lots
   ([4.4](#44-fenêtre-traitement-par-lots)).
 - 🕐 (horloge) — ouvre une session déjà traitée sans refaire la
-  transcription : sélectionner le fichier audio d'origine, l'application
-  retrouve automatiquement le dossier `sortie_…` correspondant et recharge
-  son état (y compris le contexte utilisé).
+  transcription. Trois gestes fonctionnent indifféremment : désigner le
+  dossier `sortie_…`, désigner n'importe quel fichier qu'il contient, ou
+  désigner l'enregistrement d'origine. L'application remonte la session
+  complète — audio, contexte, dossier de sortie — et récapitule dans le
+  journal ce qu'elle a trouvé : nombre de segments, nombre de locuteurs,
+  audio retrouvé, fichiers présents dans le dossier.
+
+  L'enregistrement est cherché dans le dossier de sortie lui-même, puis à
+  côté, puis dans le dossier des enregistrements configuré. À défaut, l'app
+  se rabat sur l'audio de relecture `<nom>_review_audio.wav` conservé dans
+  le dossier : une session transmise par un collègue reste donc corrigeable
+  sans l'enregistrement d'origine.
 - ⚙️ (roue crantée) — ouvre les Réglages.
 
 ### 4.2 Fenêtre Réglages
 
-Voir [« Configuration au premier lancement »](#configuration-au-premier-lancement)
-pour le détail des champs (dossier du pipeline, interpréteur Python, token
-Hugging Face). Accessible à tout moment via `⌘,` ou l'icône ⚙️.
+Accessible à tout moment via `⌘,` ou l'icône ⚙️. Voir
+[« Configuration au premier lancement »](#configuration-au-premier-lancement)
+pour le détail des champs techniques (dossier du pipeline, interpréteur
+Python, token Hugging Face).
+
+Deux réglages de dossiers, dans la section **Fichiers** :
+
+- **Dossier des enregistrements** — emplacement où s'ouvrent par défaut les
+  sélecteurs de fichiers et de dossiers. Purement pratique : il évite de
+  renaviguer à chaque fois vers le même endroit.
+- **Dossier de sauvegarde** — où écrire les transcriptions. Laissé vide, le
+  comportement historique s'applique : chaque sortie reste dans un
+  sous-dossier `sortie_…` à côté de son fichier audio. Renseigné, toutes les
+  sorties sont regroupées sous ce dossier.
+
+Une combinaison utile si vous travaillez avec un nuage : gardez les
+**enregistrements en local** — c'est la matière la plus lourde et la plus
+sensible, et les fichiers « à la demande » se téléchargent mal au moment où
+ffmpeg en a besoin — et placez le **dossier de sauvegarde dans le nuage**,
+puisque les transcriptions sont de petits fichiers texte et que c'est ce
+qu'on partage. Rappel : ce que vous déposez sur OneDrive, Google Drive ou
+iCloud quitte votre machine, ce qui contredit le principe de fonctionnement
+local — à arbitrer selon la confidentialité de vos enregistrements.
 
 ### 4.3 Fenêtre Vérification / correction
 
@@ -314,10 +378,24 @@ Ouverte depuis la fenêtre principale ou depuis la file de traitement par
 lots, une fois qu'un transcript existe. Elle affiche le texte transcrit
 segment par segment, en regard de l'audio original.
 
+La fenêtre se recharge intégralement quand on y ouvre une autre session :
+segments, locuteurs, lecteur audio et historique d'annulation repartent à
+zéro. (Dans les versions précédentes, la fenêtre étant réutilisée par macOS,
+le titre affichait le nouveau fichier pendant que le contenu restait celui
+du précédent.)
+
 **Lecteur audio** (en haut de la fenêtre) : une barre de défilement commune
 à toute la fenêtre, avec boutons lecture / pause / stop et affichage du
-temps écoulé. Cliquer sur le bouton ▶ d'un segment déplace la lecture à son
-début.
+temps écoulé. Le bouton de chaque segment fonctionne en bascule : il
+positionne la lecture au début du segment et démarre, puis arrête si on le
+recliquent pendant que ce segment joue — son icône passe de ▶ à ⏹.
+
+À la première ouverture d'une session, l'application prépare pendant
+quelques secondes un fichier `<nom>_review_audio.wav` : une copie normalisée
+en 16 kHz mono, identique à celle sur laquelle les horodatages ont été
+calculés. Sans elle, le son et le texte se décalent progressivement sur un
+long enregistrement. Ce fichier est mis en cache, l'attente ne se reproduit
+pas.
 
 **En-tête des locuteurs** : un champ par locuteur détecté (`SPEAKER_00`,
 `SPEAKER_01`, …), avec le nombre d'interventions, le temps de parole total,
@@ -330,19 +408,42 @@ de ce locuteur à la fois.
 - horodatage début/fin, éditable directement (format `hh:mm:ss`) ;
 - menu déroulant pour réattribuer le segment à un autre locuteur (utile
   quand la diarisation automatique s'est trompée) ;
-- texte éditable, avec un fond coloré selon la confiance de la
-  reconnaissance : vert (bonne confiance), orange (moyenne), rouge
-  (faible) ;
-- icône ⚠️ si le segment est signalé : confiance faible, silence probable,
-  mot répété, segment anormalement long ou court — survoler l'icône affiche
-  la raison précise ;
+- **indice de confiance en pourcentage**, dans l'en-tête du cartouche, dans
+  la teinte correspondante — voir l'encadré ci-dessous ;
+- icône ⚠️ **suivie de sa raison en clair** si le segment est signalé :
+  confiance faible, silence probable, mot répété, segment anormalement long
+  (plus de 30 secondes) ou anormalement court (moins de 0,3 seconde) ;
+- texte éditable, sur fond coloré selon la confiance, **dimensionné à la
+  hauteur de son contenu** : un segment long s'affiche en entier, sans
+  défilement interne ;
 - bouton 🗑️ pour supprimer un segment erroné, bouton « + Ajouter un
   segment » (en haut) pour en créer un manuellement au point de lecture
   actuel.
 
+**Ce que signifie le pourcentage de confiance.** C'est l'exponentielle de
+l'`avg_logprob` de Whisper, c'est-à-dire la probabilité moyenne que le
+modèle a attribuée à chacun de ses propres mots. Les seuils de couleur
+correspondent à 74 % (vert) et 45 % (orange). **Ce n'est pas un taux
+d'exactitude** : un contresens parfaitement formulé sort avec une confiance
+élevée. Sa valeur est comparative — elle classe les segments par ordre de
+suspicion et vous dit par où commencer une relecture. Les segments ajoutés à
+la main affichent « — », n'ayant aucune confiance du modèle à rapporter.
+
+**Annuler** (`⌘Z`) : rétablit l'état précédent après une suppression, un
+ajout, une division ou une fusion de locuteurs, sur trente niveaux.
+L'enregistrement écrasant le transcript sur place, une suppression par
+mégarde était auparavant définitive — et l'interface bouge sous le curseur
+au fil de la lecture, ce qui rend le clic malheureux fréquent.
+
 Bouton **« Enregistrer »** (`⌘S`) : réécrit le fichier transcript et
-régénère le fichier texte final utilisé ensuite par le résumé — aucune
-étape intermédiaire nécessaire.
+régénère le fichier texte final utilisé ensuite par le résumé. Le bouton est
+**rouge tant que des corrections ne sont pas écrites sur le disque**, gris
+avec une coche une fois enregistré. Il se fonde sur une empreinte du contenu
+et non sur un simple drapeau : annuler jusqu'à revenir exactement à l'état
+enregistré le fait repasser au gris.
+
+Bouton **« Exporter CSV »** : écrit un tableau à côté du transcript, prêt
+pour le codage — voir [section 6](#6-exporter-vers-un-tableur).
 
 ### 4.4 Fenêtre Traitement par lots
 
@@ -354,6 +455,13 @@ suite, sans intervention (adapté à un traitement de nuit).
 **Choisir un dossier…** — scanne le dossier sélectionné (uniquement les
 fichiers à sa racine, pas les sous-dossiers) et construit la liste des
 fichiers audio à traiter.
+
+**Ajouter des fichiers…** — ajoute un ou plusieurs enregistrements choisis
+un par un, sans rescanner tout un dossier. Utile pour compléter une file
+déjà constituée, ou pour composer un lot à partir de fichiers dispersés. Le
+contexte et le nombre de locuteurs sont résolus pour chaque fichier ajouté
+selon les mêmes règles que le scan, à partir du dossier où il se trouve. Les
+fichiers déjà présents dans la file sont ignorés silencieusement.
 
 **Résolution automatique du contexte et du nombre de locuteurs** — pour
 éviter de ressaisir le contexte fichier par fichier, un seul fichier texte
@@ -455,7 +563,44 @@ lisible directement, ouvert via le bouton « Ouvrir le résumé ») et un
 `.json` (structuré, réutilisable par un outil externe pour croiser plusieurs
 enregistrements).
 
-## 6. Limitations connues
+## 6. Exporter vers un tableur
+
+Le codage et l'annotation se font dans un tableur, pas dans un transcript.
+L'export CSV fait le pont : une ligne par segment, avec de quoi trier,
+filtrer, calculer des temps de parole et ajouter ses propres colonnes.
+
+Deux façons d'obtenir le fichier. Depuis l'application, le bouton
+**« Exporter CSV »** de la fenêtre de vérification écrit le tableau à côté
+du transcript, en tenant compte des noms de locuteurs que vous avez saisis.
+En ligne de commande, `pipeline/transcript_to_csv.py` fait la même chose et
+sait traiter tout un corpus d'un coup :
+
+```bash
+cd ~/transcription_pipeline && source venv/bin/activate
+python3 transcript_to_csv.py --transcript sortie_reunion/reunion_transcript.json
+python3 transcript_to_csv.py --dossier ~/Enregistrements
+```
+
+La seconde forme parcourt les sous-dossiers et convertit tous les
+transcripts trouvés, en ignorant les caches `_whisper_raw`.
+
+**Colonnes produites** : `n` (numéro d'ordre), `locuteur`, `debut` et `fin`
+au format `hh:mm:ss`, `debut_s` et `fin_s` en secondes pour trier et
+calculer, `duree_s`, `mots` (utile pour pondérer un temps de parole),
+`texte`, puis `code_1`, `code_2` et `code_3` laissées vides pour annoter
+directement sans avoir à insérer des colonnes.
+
+**Encodage** : par défaut point-virgule et UTF-8 avec BOM, faute de quoi
+Excel en français met toute la ligne dans une seule colonne et abîme les
+accents. Pour Numbers, LibreOffice ou une relecture par script, l'option
+`--style international` donne une virgule et de l'UTF-8 sans BOM.
+
+Un point-virgule, un guillemet ou un retour à la ligne présents dans le
+texte transcrit sont correctement protégés : ils ne décalent pas les
+colonnes. Le fichier `pipeline/test_transcript_to_csv.py` vérifie ces cas,
+parmi 24 contrôles, et peut être relancé à tout moment.
+
+## 7. Limitations connues
 
 - **Pas de `.dmg` packagé ni de signature par un compte développeur Apple
   payant** — l'installation automatique ([2.0](#20-installation-automatique-recommandé))
@@ -469,13 +614,27 @@ enregistrements).
   processus `python` résiduel ne tourne avant de relancer un traitement sur
   le même fichier.
 - **Traitement par lots : dossier racine uniquement** — les sous-dossiers ne
-  sont pas parcourus automatiquement dans cette version.
+  sont pas parcourus automatiquement dans cette version. Le bouton
+  « Ajouter des fichiers… » permet de contourner ponctuellement cette
+  limite.
+- **Noms de locuteurs écrits en dur à l'enregistrement** — quand vous
+  enregistrez depuis la fenêtre de vérification, les noms saisis remplacent
+  les identifiants `SPEAKER_xx` dans le transcript. Le renommage n'est donc
+  pas réversible, et la correspondance n'est pas conservée séparément. Le
+  fichier `_speakers.json` produit par le pipeline n'est pas encore relu par
+  l'application.
+- **L'avancement des corrections ne se partage pas encore** — l'état de la
+  session est mémorisé par machine et par compte, pas dans le dossier de
+  sortie. Copier ou synchroniser un dossier `sortie_…` transmet les
+  transcripts et les corrections déjà enregistrées, mais pas l'état de
+  travail. Un correcteur qui reprend le dossier repart donc de ce qui a été
+  écrit sur disque.
 - **Pas de mise à jour automatique** — toute nouvelle version doit être
   réinstallée manuellement : `git pull` (ou nouveau téléchargement du zip)
   puis relancer `TranscriptionTableRonde_install.sh`, qui écrase l'ancienne
   app dans `~/Applications` et met à jour le pipeline en place.
 
-## 7. Glossaire
+## 8. Glossaire
 
 - **Transcription** — conversion de l'audio en texte.
 - **Diarisation** — détection de « qui parle quand », sans identification
