@@ -17,6 +17,17 @@ final class SummaryRunner: ObservableObject {
 
         logLines.removeAll()
         resumeMarkdownPath = nil
+
+        // Garde-fou : on vérifie l'installation avant de lancer Python,
+        // pour signaler le champ des Réglages à corriger plutôt que de
+        // laisser passer un "[Errno 2] No such file or directory" brut.
+        if let erreur = settings.erreurDInstallation(pourScript: "summarize.py") {
+            appendLine("Impossible de lancer le résumé.")
+            appendLine(erreur)
+            state = .finished(success: false)
+            return
+        }
+
         state = .running
 
         let process = Process()

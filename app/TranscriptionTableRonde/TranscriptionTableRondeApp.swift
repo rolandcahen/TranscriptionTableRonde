@@ -53,6 +53,10 @@ struct TranscriptionTableRondeApp: App {
             SettingsView()
                 .environmentObject(settings)
         }
+        // .contentMinSize et non .contentSize : la fenêtre s'ouvre à sa
+        // taille idéale mais reste étirable, pour lire en entier des chemins
+        // qui dépassent largement la largeur d'origine.
+        .windowResizability(.contentMinSize)
 
         WindowGroup(id: "review", for: ReviewTarget.self) { $target in
             if let target {

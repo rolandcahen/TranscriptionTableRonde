@@ -30,6 +30,18 @@ final class PipelineRunner: ObservableObject {
         currentStage = 0
         progressFraction = nil
         progressLabel = ""
+
+        // Garde-fou : on vérifie l'installation avant de lancer Python,
+        // pour signaler le champ des Réglages à corriger plutôt que de
+        // laisser passer un "[Errno 2] No such file or directory" brut.
+        if let erreur = settings.erreurDInstallation(pourScript: "transcribe_diarize.py") {
+            appendLine("Impossible de lancer la transcription.")
+            appendLine(erreur)
+            progressLabel = "Installation incomplète — voir les Réglages"
+            state = .finished(success: false)
+            return
+        }
+
         state = .running
 
         let process = Process()

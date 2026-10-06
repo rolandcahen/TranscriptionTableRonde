@@ -70,4 +70,40 @@ final class AppSettings: ObservableObject {
         }
         return URL(fileURLWithPath: trimmedRoot, isDirectory: true).appendingPathComponent(folderName)
     }
+
+    /// Vérifie, avant de lancer un sous-processus, que l'installation
+    /// désignée par les Réglages existe bien. Retourne nil si tout est en
+    /// place, sinon un message destiné à l'utilisateur, qui nomme le champ
+    /// des Réglages à corriger.
+    ///
+    /// Sans ce contrôle, un mauvais chemin ne se manifeste que par l'erreur
+    /// brute de Python ("can't open file '…/summarize.py': [Errno 2] No such
+    /// file or directory"), qui dit bien ce qui manque mais pas où le
+    /// corriger — et qui laisse surtout croire à un problème du fichier
+    /// audio ou du dossier de sortie.
+    func erreurDInstallation(pourScript script: String) -> String? {
+        let fm = FileManager.default
+        let interpreteur = pythonPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        var estDossier: ObjCBool = false
+
+        guard !interpreteur.isEmpty,
+              fm.fileExists(atPath: interpreteur, isDirectory: &estDossier),
+              !estDossier.boolValue else {
+            return "Interpréteur Python introuvable : \(interpreteur.isEmpty ? "(champ vide)" : interpreteur) — "
+                + "corrigez le champ « Interpréteur Python (venv) » dans les Réglages (⌘,)."
+        }
+        guard fm.isExecutableFile(atPath: interpreteur) else {
+            return "L'interpréteur Python indiqué n'est pas exécutable : \(interpreteur) — "
+                + "corrigez le champ « Interpréteur Python (venv) » dans les Réglages (⌘,)."
+        }
+
+        let dossier = pipelineFolder.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cheminScript = (dossier as NSString).appendingPathComponent(script)
+        guard !dossier.isEmpty, fm.fileExists(atPath: cheminScript) else {
+            return "\(script) est introuvable dans le dossier du pipeline : \(dossier.isEmpty ? "(champ vide)" : dossier) — "
+                + "ce champ doit désigner le dossier d'installation qui contient les scripts Python, "
+                + "et non un dossier de sortie « sortie_… ». Corrigez le champ « Dossier du pipeline » dans les Réglages (⌘,)."
+        }
+        return nil
+    }
 }
