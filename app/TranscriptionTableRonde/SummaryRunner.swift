@@ -9,6 +9,8 @@ final class SummaryRunner: ObservableObject {
     @Published var state: RunState = .idle
     @Published var logLines: [String] = []
     @Published var resumeMarkdownPath: URL?
+    /// Voir PipelineRunner.interrompu : un arrêt demandé n'est pas un échec.
+    @Published var interrompu = false
 
     private var process: Process?
 
@@ -17,6 +19,7 @@ final class SummaryRunner: ObservableObject {
 
         logLines.removeAll()
         resumeMarkdownPath = nil
+        interrompu = false
 
         // Garde-fou : on vérifie l'installation avant de lancer Python,
         // pour signaler le champ des Réglages à corriger plutôt que de
@@ -86,6 +89,9 @@ final class SummaryRunner: ObservableObject {
     }
 
     func cancel() {
+        guard state == .running else { return }
+        interrompu = true
+        appendLine("Interruption demandée — arrêt de la génération du résumé.")
         process?.terminate()
     }
 

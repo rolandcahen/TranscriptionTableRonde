@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import AVFoundation
 import NaturalLanguage
 
@@ -67,6 +68,15 @@ struct ReviewView: View {
     @State private var manualSpeakerIDs: [String] = []
     @State private var nextManualSpeakerNumber = 1
     @State private var speakersExpanded = true
+    /// Position du curseur dans chaque segment, en caractères. Conservée par
+    /// segment et non globalement : on revient souvent sur un bloc qu'on
+    /// était en train de corriger, et y retrouver son point d'arrêt fait
+    /// toute la différence sur un segment de deux cents mots.
+    @State private var curseurParSegment: [UUID: Int] = [:]
+    /// Dernier segment où le curseur a bougé. Sert de « ici » implicite pour
+    /// les commandes clavier, qui n'ont pas d'autre moyen de savoir de quel
+    /// bloc on parle.
+    @State private var segmentActif: UUID?
     // Noms de personnes détectés dans le fichier de contexte du fichier
     // (`<basename>_contexte.txt`), proposés en un clic pour renommer les
     // locuteurs plutôt que de les retaper.
@@ -142,7 +152,9 @@ struct ReviewView: View {
                 Text("\(segments.count) segment(s) · \(flaggedCount) signalé(s)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Plusieurs locuteurs dans un même segment : tapez « \(Self.speakerSplitMarker) » dans le texte au changement de locuteur, puis ✂️ pour diviser.")
+                Text("Plusieurs locuteurs dans un même segment : au changement de locuteur, "
+                     + "passez à la ligne et commencez par un tiret — comme dans un dialogue — "
+                     + "ou tapez « \(Self.speakerSplitMarker) », puis ✂️ pour diviser.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -240,6 +252,22 @@ struct ReviewView: View {
                 Text("\(formatTimestamp(currentTime)) / \(formatTimestamp(duration))")
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
+
+                Divider().frame(height: 14)
+
+                Button {
+                    lireDepuisCurseur()
+                } label: {
+                    Label(isPlaying ? "Pause" : "Lire au curseur",
+                          systemImage: isPlaying ? "pause.circle" : "text.cursor")
+                }
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(segmentActif == nil && !isPlaying)
+                .help("⌘⏎ — reprend la lecture à l'endroit du curseur dans le texte, et "
+                      + "fonctionne même pendant la frappe. La barre d'espace fait la même "
+                      + "bascule, mais seulement hors d'une zone de texte, où elle sert à "
+                      + "taper une espace.")
+
                 Spacer()
             }
             .disabled(isPreparingAudio)
@@ -397,6 +425,15 @@ struct ReviewView: View {
                 guard isPlaying, let newValue else { return }
                 withAnimation { proxy.scrollTo(newValue, anchor: .center) }
             }
+            // La barre d'espace ne peut pas piloter la lecture pendant la
+            // frappe : dans une zone de texte, elle doit taper une espace.
+            // Elle n'agit donc que lorsque la liste elle-même a le focus,
+            // c'est-à-dire hors édition — et ⌘⏎ prend le relais dedans.
+            .focusable()
+            .onKeyPress(.space) {
+                basculerLectureGlobale()
+                return .handled
+            }
         }
     }
 
@@ -467,15 +504,18 @@ struct ReviewView: View {
                     .help("Segment signalé : \(flagReason(s)). À vérifier en priorité.")
                 }
                 Spacer()
-                if s.text.contains(Self.speakerSplitMarker) {
-                    Button {
-                        splitSegment(s.id)
-                    } label: {
-                        Image(systemName: "scissors")
-                    }
-                    .buttonStyle(.plain)
-                    .help("Diviser ce segment à chaque « \(Self.speakerSplitMarker) » — répartition du temps proportionnelle à la longueur du texte de chaque partie.")
+                // Toujours présents, jamais grisés : si le texte porte des
+                // marqueurs ou des tirets de dialogue, on coupe dessus ;
+                // sinon on coupe là où est le curseur. Le seul cas sans
+                // effet est un curseur collé à un bord, et l'infobulle le
+                // dit plutôt que de laisser un bouton mort.
+                Button {
+                    diviser(s)
+                } label: {
+                    Image(systemName: "scissors")
                 }
+                .buttonStyle(.plain)
+                .help(aideDivision(s))
                 Button {
                     deleteSegment(s.id)
                 } label: {
@@ -500,10 +540,19 @@ struct ReviewView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .opacity(0)
                     .accessibilityHidden(true)
-                TextEditor(text: segment.text)
-                    .font(.system(.body))
-                    .scrollDisabled(true)
-                    .padding(4)
+                SegmentTextView(
+                    texte: segment.text,
+                    positionCurseur: Binding(
+                        get: { curseurParSegment[s.id] ?? 0 },
+                        set: { curseurParSegment[s.id] = $0 }
+                    ),
+                    surlignage: plageLue(de: s),
+                    couleurSurlignage: NSColor.controlAccentColor.withAlphaComponent(0.30),
+                    onCurseurDeplace: { position in
+                        segmentActif = s.id
+                        curseurParSegment[s.id] = position
+                    }
+                )
             }
             .background(confidenceColor(s.avgLogprob))
             .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -577,6 +626,80 @@ struct ReviewView: View {
         isPlaying && currentTime >= segment.start && currentTime < segment.end
     }
 
+    /// Bascule simple, sans déplacer la tête de lecture : c'est ce qu'on
+    /// attend d'une barre d'espace, et c'est ce qui permet de s'arrêter une
+    /// seconde pour corriger un mot puis de repartir au même endroit.
+    private func basculerLectureGlobale() {
+        guard player != nil else { return }
+        if isPlaying {
+            player?.pause()
+            isPlaying = false
+        } else {
+            player?.play()
+            isPlaying = true
+        }
+    }
+
+    /// Reprend la lecture à l'endroit du curseur dans le texte.
+    ///
+    /// La correspondance entre une position dans le texte et un instant du
+    /// son est proportionnelle à la longueur du texte : faute d'horodatage
+    /// par mot — écarté parce qu'il multipliait le temps de transcription
+    /// par vingt — c'est la meilleure approximation disponible. Elle suppose
+    /// un débit régulier, ce qui est faux dans le détail mais suffisant pour
+    /// retomber à quelques secondes près dans un bloc de deux cents mots, au
+    /// lieu de le réécouter en entier.
+    private func instantDuCurseur(dans segment: EditableSegment, position: Int) -> Double {
+        let longueur = (segment.text as NSString).length
+        guard longueur > 0 else { return segment.start }
+        let part = min(max(Double(position) / Double(longueur), 0), 1)
+        return segment.start + (segment.end - segment.start) * part
+    }
+
+    private func lireDepuisCurseur() {
+        guard player != nil else { return }
+        if isPlaying {
+            player?.pause()
+            isPlaying = false
+            return
+        }
+        if let id = segmentActif, let segment = segments.first(where: { $0.id == id }) {
+            seek(to: instantDuCurseur(dans: segment, position: curseurParSegment[id] ?? 0))
+        }
+        player?.play()
+        isPlaying = true
+    }
+
+    /// Mot que la tête de lecture est censée atteindre, à surligner.
+    ///
+    /// Même approximation que ci-dessus, prise dans l'autre sens. On surligne
+    /// le mot entier plutôt que le caractère calculé : un surlignage d'un
+    /// seul signe serait illisible, et donnerait surtout une fausse
+    /// impression de précision.
+    private func plageLue(de segment: EditableSegment) -> Range<Int>? {
+        guard isPlaying, lit(segment) else { return nil }
+        let texte = segment.text as NSString
+        let duree = segment.end - segment.start
+        guard texte.length > 0, duree > 0 else { return nil }
+
+        let avance = min(max((currentTime - segment.start) / duree, 0), 1)
+        let index = min(Int(Double(texte.length) * avance), texte.length - 1)
+
+        let blancs = CharacterSet.whitespacesAndNewlines
+        func estBlanc(_ i: Int) -> Bool {
+            guard i >= 0, i < texte.length else { return true }
+            guard let scalaire = UnicodeScalar(UInt32(texte.character(at: i))) else { return false }
+            return blancs.contains(scalaire)
+        }
+
+        guard !estBlanc(index) else { return nil }
+        var debut = index
+        while debut > 0, !estBlanc(debut - 1) { debut -= 1 }
+        var fin = index
+        while fin < texte.length, !estBlanc(fin) { fin += 1 }
+        return fin > debut ? debut..<fin : nil
+    }
+
     /// Le bouton de chaque segment fonctionne en bascule : s'il joue déjà
     /// ce segment, il arrête ; sinon il s'y positionne et démarre.
     private func basculerLecture(_ segment: EditableSegment) {
@@ -596,20 +719,147 @@ struct ReviewView: View {
     /// de locuteur — évite de devoir repérer l'instant exact à l'écoute.
     static let speakerSplitMarker = "|"
 
+    /// Tirets admis comme tirets de dialogue, du clavier à la typographie
+    /// soignée : trait d'union, tiret demi-cadratin, tiret cadratin.
+    private static let tiretsDeDialogue: Set<Character> = ["-", "\u{2013}", "\u{2014}"]
+
+    /// Traduit les tirets de dialogue en marqueurs de division.
+    ///
+    /// Dans un texte dialogué, un tiret en début de ligne annonce qu'une
+    /// autre personne prend la parole. C'est la convention française, c'est
+    /// ce que la main tape spontanément en corrigeant un gros bloc, et il
+    /// serait absurde d'exiger en plus un « | » pour dire la même chose.
+    ///
+    /// Le tiret doit être suivi d'une espace : sans cette condition, une
+    /// ligne commençant par « -5 % » ou par une énumération technique serait
+    /// coupée en deux. La typographie française met de toute façon une
+    /// espace après le tiret de dialogue.
+    static func normaliserMarqueursDeDivision(_ texte: String) -> String {
+        var sortie = ""
+        var debutDeLigne = true
+        var index = texte.startIndex
+        while index < texte.endIndex {
+            let caractere = texte[index]
+            let suivant = texte.index(after: index)
+
+            if caractere.isNewline {
+                sortie.append(caractere)
+                debutDeLigne = true
+                index = suivant
+                continue
+            }
+            if debutDeLigne, caractere == " " || caractere == "\t" {
+                sortie.append(caractere)
+                index = suivant
+                continue
+            }
+            if debutDeLigne, Self.tiretsDeDialogue.contains(caractere) {
+                let suit = suivant < texte.endIndex ? texte[suivant] : " "
+                if suit.isWhitespace {
+                    sortie.append(contentsOf: Self.speakerSplitMarker)
+                    debutDeLigne = false
+                    index = suivant
+                    continue
+                }
+            }
+            debutDeLigne = false
+            sortie.append(caractere)
+            index = suivant
+        }
+        return sortie
+    }
+
+    /// Morceaux qu'une division produirait, marqueurs et tirets confondus.
+    static func morceauxDeDivision(_ texte: String) -> [String] {
+        normaliserMarqueursDeDivision(texte)
+            .components(separatedBy: Self.speakerSplitMarker)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    static func peutEtreDivise(_ texte: String) -> Bool {
+        morceauxDeDivision(texte).count > 1
+    }
+
     /// Découpe le texte du segment à chaque marqueur, répartit la durée
     /// entre les morceaux au prorata de leur longueur de texte (approximatif
     /// mais un bon point de départ — les horodatages restent éditables
     /// ensuite), et remplace le segment d'origine par autant de segments que
     /// de morceaux non vides. Tous héritent du même locuteur au départ : à
     /// réattribuer ensuite via le menu de chaque nouveau segment.
+    /// Divise comme l'utilisateur s'y attend : sur les marqueurs s'il y en
+    /// a, sinon là où il vient de poser le curseur.
+    private func diviser(_ segment: EditableSegment) {
+        if Self.peutEtreDivise(segment.text) {
+            splitSegment(segment.id)
+        } else {
+            diviserAuCurseur(segment)
+        }
+    }
+
+    private func aideDivision(_ segment: EditableSegment) -> String {
+        if Self.peutEtreDivise(segment.text) {
+            return "Diviser ce segment en \(Self.morceauxDeDivision(segment.text).count) parties, "
+                + "à chaque « \(Self.speakerSplitMarker) » et à chaque tiret de dialogue en début "
+                + "de ligne. Le temps est réparti au prorata de la longueur du texte de chaque "
+                + "partie, et les horodatages restent modifiables ensuite."
+        }
+        let position = curseurParSegment[segment.id] ?? 0
+        if position > 0 && position < (segment.text as NSString).length {
+            return "Couper ce segment en deux à la position du curseur. Pour plusieurs coupures "
+                + "d'un coup, passez à la ligne au changement de locuteur et commencez par un "
+                + "tiret, ou tapez « \(Self.speakerSplitMarker) »."
+        }
+        return "Placez le curseur dans le texte à l'endroit du changement de locuteur, ou passez "
+            + "à la ligne et commencez par un tiret, puis cliquez ici."
+    }
+
+    /// Coupe en deux à la position du curseur, en répartissant la durée au
+    /// prorata de la longueur de chaque moitié — même règle que la division
+    /// par marqueurs, pour que les deux gestes donnent le même résultat sur
+    /// un même point de coupe.
+    private func diviserAuCurseur(_ segment: EditableSegment) {
+        guard let index = segments.firstIndex(where: { $0.id == segment.id }) else { return }
+        let texte = segment.text as NSString
+        let position = curseurParSegment[segment.id] ?? 0
+        guard position > 0, position < texte.length else { return }
+
+        let avant = texte.substring(to: position).trimmingCharacters(in: .whitespacesAndNewlines)
+        let apres = texte.substring(from: position).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !avant.isEmpty, !apres.isEmpty else { return }
+
+        memoriserPourAnnulation()
+        let original = segments[index]
+        let duree = original.end - original.start
+        let total = avant.count + apres.count
+        let coupure = total > 0
+            ? original.start + duree * Double(avant.count) / Double(total)
+            : original.start + duree / 2
+
+        var premier = original
+        premier.text = avant
+        premier.end = coupure
+        // chargeSpeakerID et chargeText restent vides : les deux moitiés
+        // sont du contenu nouveau, les indicateurs hérités du segment entier
+        // ne les décrivent plus et seront retirés à l'enregistrement.
+        let second = EditableSegment(
+            start: coupure,
+            end: original.end,
+            text: apres,
+            speakerID: original.speakerID,
+            avgLogprob: original.avgLogprob,
+            noSpeechProb: original.noSpeechProb,
+            raw: original.raw
+        )
+        segments.replaceSubrange(index...index, with: [premier, second])
+        curseurParSegment[original.id] = 0
+    }
+
     private func splitSegment(_ id: UUID) {
         guard let index = segments.firstIndex(where: { $0.id == id }) else { return }
         memoriserPourAnnulation()
         let original = segments[index]
-        let parts = original.text
-            .components(separatedBy: Self.speakerSplitMarker)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        let parts = Self.morceauxDeDivision(original.text)
         guard parts.count > 1 else { return }
 
         let totalChars = parts.reduce(0) { $0 + $1.count }
@@ -1077,3 +1327,99 @@ struct ReviewView: View {
         return String(format: "%02d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
     }
 }
+
+
+/// Zone de texte d'un segment, bâtie sur NSTextView.
+///
+/// Raison d'être : `TextEditor` n'expose ni la position du curseur ni la
+/// sélection. Or sans elles, deux gestes sont tout simplement impossibles —
+/// couper un segment là où l'on vient de cliquer, et reprendre la lecture au
+/// même endroit. Aucun arrangement côté SwiftUI n'y change rien ; il faut
+/// descendre à AppKit, qui les donne.
+///
+/// Le surlignage de la tête de lecture passe par un attribut de fond posé
+/// sur le stockage de texte, et jamais par une modification de la chaîne :
+/// le texte affiché reste exactement celui du modèle, à la virgule près.
+struct SegmentTextView: NSViewRepresentable {
+    @Binding var texte: String
+    @Binding var positionCurseur: Int
+    var surlignage: Range<Int>?
+    var couleurSurlignage: NSColor
+    var onCurseurDeplace: ((Int) -> Void)?
+
+    func makeNSView(context: Context) -> NSTextView {
+        let vue = NSTextView()
+        vue.delegate = context.coordinator
+        vue.isRichText = false
+        vue.allowsUndo = true
+        vue.isAutomaticQuoteSubstitutionEnabled = false
+        vue.isAutomaticDashSubstitutionEnabled = false
+        vue.font = .systemFont(ofSize: NSFont.systemFontSize)
+        vue.textColor = .labelColor
+        vue.drawsBackground = false
+        vue.isVerticallyResizable = false
+        vue.isHorizontallyResizable = false
+        vue.textContainerInset = NSSize(width: 5, height: 7)
+        vue.textContainer?.widthTracksTextView = true
+        vue.textContainer?.lineFragmentPadding = 0
+        vue.string = texte
+        return vue
+    }
+
+    func updateNSView(_ vue: NSTextView, context: Context) {
+        context.coordinator.parent = self
+
+        if vue.string != texte {
+            // Le curseur est rétabli après une réécriture venue du modèle :
+            // sans cela, la moindre mise à jour le renverrait au début du
+            // bloc, ce qui rend toute correction longue impraticable.
+            let ancien = vue.selectedRange().location
+            context.coordinator.enMiseAJour = true
+            vue.string = texte
+            let limite = (texte as NSString).length
+            vue.setSelectedRange(NSRange(location: min(ancien, limite), length: 0))
+            context.coordinator.enMiseAJour = false
+        }
+
+        guard let stockage = vue.textStorage else { return }
+        let tout = NSRange(location: 0, length: stockage.length)
+        stockage.removeAttribute(.backgroundColor, range: tout)
+        // Le fond est retiré des attributs de frappe, faute de quoi le mot
+        // surligné contaminerait tout ce qui serait tapé à sa suite.
+        vue.typingAttributes.removeValue(forKey: .backgroundColor)
+
+        guard let surlignage else { return }
+        let debut = max(0, min(surlignage.lowerBound, stockage.length))
+        let fin = max(debut, min(surlignage.upperBound, stockage.length))
+        guard fin > debut else { return }
+        stockage.addAttribute(.backgroundColor, value: couleurSurlignage,
+                              range: NSRange(location: debut, length: fin - debut))
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: SegmentTextView
+        /// Vrai pendant qu'on réécrit la vue depuis le modèle. Les
+        /// notifications émises alors décrivent notre propre écriture, pas
+        /// un geste de l'utilisateur : les relayer ferait croire à un
+        /// déplacement de curseur et déclencherait une lecture non demandée.
+        var enMiseAJour = false
+
+        init(_ parent: SegmentTextView) { self.parent = parent }
+
+        func textDidChange(_ notification: Notification) {
+            guard !enMiseAJour, let vue = notification.object as? NSTextView else { return }
+            parent.texte = vue.string
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard !enMiseAJour, let vue = notification.object as? NSTextView else { return }
+            let position = vue.selectedRange().location
+            guard position != parent.positionCurseur else { return }
+            parent.positionCurseur = position
+            parent.onCurseurDeplace?(position)
+        }
+    }
+}
+

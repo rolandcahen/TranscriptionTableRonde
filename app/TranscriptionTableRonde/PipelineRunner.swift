@@ -18,6 +18,11 @@ final class PipelineRunner: ObservableObject {
     /// progression chiffrée n'est disponible (barre indéterminée).
     @Published var progressFraction: Double?
     @Published var progressLabel: String = ""
+    /// Vrai quand l'arrêt vient de l'utilisateur. Un processus interrompu
+    /// rend le même code de sortie qu'un processus qui a échoué : sans ce
+    /// drapeau, l'app annoncerait « le traitement a échoué » à quelqu'un qui
+    /// vient précisément de demander l'arrêt.
+    @Published var interrompu = false
 
     private var process: Process?
     private var currentStage: Int = 0
@@ -26,6 +31,7 @@ final class PipelineRunner: ObservableObject {
         guard state != .running else { return }
 
         logLines.removeAll()
+        interrompu = false
         self.outputFolder = outputFolder
         currentStage = 0
         progressFraction = nil
@@ -119,6 +125,12 @@ final class PipelineRunner: ObservableObject {
     }
 
     func cancel() {
+        guard state == .running else { return }
+        interrompu = true
+        appendLine("Interruption demandée — arrêt du traitement.")
+        // La transcription déjà calculée reste dans son fichier de cache :
+        // une relance sur le même fichier repartira directement de l'étape 2.
+        appendLine("Ce qui a déjà été transcrit est conservé : une relance reprendra où c'est possible.")
         process?.terminate()
     }
 

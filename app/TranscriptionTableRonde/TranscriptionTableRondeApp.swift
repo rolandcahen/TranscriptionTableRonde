@@ -28,12 +28,23 @@ struct TranscriptionTableRondeApp: App {
                 .environmentObject(settings)
                 .environmentObject(batchQueue)
                 .environmentObject(singleSession)
-                // 760 et non 640 : le bandeau de signatures occupe 277 pt à
-                // droite du titre, et en dessous de cette largeur il
-                // viendrait chevaucher le sous-titre.
-                .frame(minWidth: 760, minHeight: 560)
+                // 900 et non 640 : le bandeau de signatures occupe 414 pt à
+                // droite du titre — ENSCi 80, CRD 86, ENS Paris-Saclay 145,
+                // Sepsis 61, plus trois espacements de 14 — et en dessous de
+                // cette largeur il viendrait chevaucher le sous-titre.
+                // maxHeight infini et alignement en haut : sans cela, un
+                // contenu plus court que la hauteur minimale se centre dans
+                // la fenêtre et laisse une bande vide en haut comme en bas —
+                // visible dès que les trois onglets sont repliés. Le contenu
+                // doit se coller au titre, et le vide tomber en dessous.
+                .frame(minWidth: 900, idealWidth: 1000, maxWidth: .infinity,
+                       minHeight: 560, idealHeight: 720, maxHeight: .infinity,
+                       alignment: .top)
         }
-        .windowResizability(.contentSize)
+        // .contentMinSize et non .contentSize : le premier traite la taille
+        // du contenu comme un plancher, le second comme une consigne stricte,
+        // ce qui empêchait tout agrandissement vertical de la fenêtre.
+        .windowResizability(.contentMinSize)
         .commands {
             // Remplace le panneau « À propos » standard par notre fenêtre,
             // qui porte les signatures institutionnelles et la notice.
@@ -41,6 +52,27 @@ struct TranscriptionTableRondeApp: App {
                 Button("À propos de Transcription table ronde") {
                     openWindow(id: "about")
                 }
+            }
+            // Les trois actions de la barre d'outils, également au menu.
+            // Une icône sans libellé se devine ; un menu se lit, s'explore,
+            // et porte son raccourci clavier à côté de son nom.
+            CommandMenu("Traitement") {
+                Button("Traitement par lots…") {
+                    openWindow(id: "batchQueue")
+                }
+                .keyboardShortcut("l", modifiers: [.command, .shift])
+
+                Button("Ouvrir une session existante…") {
+                    NotificationCenter.default.post(name: .ttrOuvrirSessionExistante, object: nil)
+                }
+                .keyboardShortcut("o", modifiers: .command)
+
+                Divider()
+
+                Button("Réglages…") {
+                    NotificationCenter.default.post(name: .ttrOuvrirReglages, object: nil)
+                }
+                .keyboardShortcut(",", modifiers: .command)
             }
         }
 

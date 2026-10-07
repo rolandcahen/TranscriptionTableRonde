@@ -1,22 +1,36 @@
 import SwiftUI
 import AppKit
 
-/// Les trois signatures institutionnelles du projet.
+/// Les quatre signatures institutionnelles du projet.
 ///
 /// Les hauteurs diffèrent volontairement d'un logo à l'autre : le bloc du
-/// CRD est purement typographique et sur quatre niveaux de corps, là où le
+/// CRD est purement typographique et sur trois niveaux de corps, là où le
 /// Sepsis Center a un symbole et l'ENS Paris-Saclay une composition très
 /// horizontale. À hauteur égale, le CRD deviendrait une texture grise
 /// illisible. Ces valeurs sont donc des hauteurs *optiques*, calibrées à
 /// l'œil, pas une normalisation géométrique.
+///
+/// L'ENSCI est le cas le plus contraint : son logo superpose un mot en gros
+/// corps et un « LES ATELIERS » qui n'occupe qu'un cinquième de la hauteur
+/// totale. Descendre à la hauteur des autres rendrait cette seconde ligne
+/// illisible ; 40 points la portent à environ 8 points de corps, ce qui est
+/// le plancher acceptable, et c'est ce qui fixe la hauteur de l'ensemble.
 struct SignaturesView: View {
-    var hauteurCRD: CGFloat = 48
+    var hauteurENSCI: CGFloat = 40
+    // 44 et non plus 48 : la nouvelle composition du CRD tient sur trois
+    // lignes au lieu de quatre, donc chaque ligne approche onze points de
+    // corps là où l'ancienne en faisait neuf. On gagne en lisibilité tout en
+    // perdant quatre points de hauteur.
+    var hauteurCRD: CGFloat = 44
     var hauteurENS: CGFloat = 32
     var hauteurSepsis: CGFloat = 44
     var espacement: CGFloat = 14
 
     var body: some View {
         HStack(alignment: .center, spacing: espacement) {
+            logo("LogoENSCI",
+                 hauteur: hauteurENSCI,
+                 description: "ENSCi-Les Ateliers — École nationale supérieure de création industrielle")
             logo("LogoCRD",
                  hauteur: hauteurCRD,
                  description: "Centre de Recherche en Design — ENSCI-Les Ateliers / École normale supérieure Paris-Saclay")

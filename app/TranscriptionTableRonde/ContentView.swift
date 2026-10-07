@@ -19,6 +19,9 @@ struct ContentView: View {
     @State private var numSpeakersText: String = ""
     @State private var isTargeted = false
     @State private var sessionError: String?
+    // Journal replié au départ : il sert au diagnostic, pas à la conduite
+    // ordinaire d'une session, et il mangeait la moitié de la fenêtre.
+    @State private var journalOuvert = false
     @State private var categoriesText: String = ContentView.defaultCategoriesText
     @State private var contextText: String = ""
     // Message affiché quand une session a été interrompue (app quittée ou
@@ -84,6 +87,17 @@ struct ContentView: View {
                 }
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(audioURL == nil || runner.state == .running || settings.hfToken.isEmpty)
+
+                if runner.state == .running {
+                    Button("Interrompre") {
+                        runner.cancel()
+                    }
+                    .tint(.red)
+                    .keyboardShortcut(".", modifiers: .command)
+                    .help("Arrête le traitement en cours sans quitter l'application (⌘.). "
+                          + "La transcription déjà calculée est conservée : une relance sur le même "
+                          + "fichier reprendra à la diarisation plutôt que de tout refaire.")
+                }
             }
 
             if settings.hfToken.isEmpty {
@@ -102,7 +116,7 @@ struct ContentView: View {
                 progressView
             }
 
-            logView
+            journalSection
 
             if case .finished(let success) = runner.state {
                 resultBanner(success: success)
@@ -110,6 +124,14 @@ struct ContentView: View {
 
             if case .finished(true) = runner.state, let audioURL, let outputFolder = runner.outputFolder {
                 summarySection(audioURL: audioURL, outputFolder: outputFolder)
+            }
+
+            // Journal replié : rien dans la vue n'est élastique, la place en
+            // trop doit donc aller quelque part — ici, sous le dernier
+            // élément. Journal déplié : c'est lui qui s'étire, et ce ressort
+            // lui disputerait l'espace sans raison.
+            if !journalOuvert {
+                Spacer(minLength: 0)
             }
         }
         .padding(20)
@@ -159,7 +181,18 @@ struct ContentView: View {
                 } label: {
                     Image(systemName: "gearshape")
                 }
+                .help("Réglages (⌘,) : dossiers de travail, emplacement du pipeline Python, "
+                      + "interpréteur et token Hugging Face.")
             }
+        }
+        // Les mêmes trois actions, atteignables au menu : une icône sans
+        // libellé se devine, un menu se lit — et se cherche là où on a
+        // l'habitude de chercher.
+        .onReceive(NotificationCenter.default.publisher(for: .ttrOuvrirSessionExistante)) { _ in
+            openExistingSession()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .ttrOuvrirReglages)) { _ in
+            openSettings()
         }
     }
 
@@ -207,17 +240,23 @@ struct ContentView: View {
         let backgroundColor: Color = isTargeted ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlBackgroundColor)
         let borderColor: Color = isTargeted ? Color.accentColor : Color.secondary.opacity(0.3)
 
-        return VStack(spacing: 8) {
+        // Disposition horizontale et marges resserrées : la zone de dépôt
+        // occupait près d'un quart de la fenêtre pour une information qui
+        // tient sur une ligne, au détriment du journal et des réglages de
+        // traitement, qui servent à chaque session.
+        return HStack(spacing: 10) {
             Image(systemName: icon)
-                .font(.system(size: 32))
+                .font(.system(size: 20))
                 .foregroundStyle(iconColor)
             Text(audioURL?.lastPathComponent ?? "Glissez un fichier .wav ou .mp3 ici, ou cliquez pour en choisir un")
                 .font(.callout)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .foregroundStyle(audioURL == nil ? .secondary : .primary)
+            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity)
-        .padding(28)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
         .background(
             RoundedRectangle(cornerRadius: 12)
                 .fill(backgroundColor)
@@ -230,6 +269,28 @@ struct ContentView: View {
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
             handleDrop(providers)
         }
+    }
+
+    /// Journal replié par défaut, avec la dernière ligne en guise de
+    /// résumé dans l'en-tête : refermé, il ne doit pas pour autant laisser
+    /// croire que rien ne se passe. C'est ce qui le distingue d'un simple
+    /// masquage.
+    private var journalSection: some View {
+        DisclosureGroup(isExpanded: $journalOuvert) {
+            logView
+        } label: {
+            HStack(spacing: 8) {
+                Text("Journal")
+                if !journalOuvert, let derniere = runner.logLines.last {
+                    Text(derniere)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+        }
+        .font(.caption)
     }
 
     private var logView: some View {
@@ -264,14 +325,24 @@ struct ContentView: View {
             .background(Color(nsColor: .textBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
-        .frame(minHeight: 220)
+        // Le journal est le seul élément conçu pour absorber la hauteur
+        // supplémentaire quand on agrandit la fenêtre : c'est celui dont on
+        // veut voir davantage de lignes, pas celui qu'on veut voir flotter.
+        .frame(minHeight: 220, maxHeight: .infinity)
+        .padding(.top, 4)
     }
 
     private func resultBanner(success: Bool) -> some View {
-        HStack {
-            Image(systemName: success ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .foregroundStyle(success ? .green : .red)
-            Text(success ? "Terminé. Fichiers générés dans le dossier de sortie." : "Le traitement a échoué — voir le journal ci-dessus.")
+        let interrompu = !success && runner.interrompu
+        return HStack {
+            Image(systemName: success ? "checkmark.circle.fill"
+                  : (interrompu ? "stop.circle.fill" : "xmark.circle.fill"))
+                .foregroundStyle(success ? .green : (interrompu ? .orange : .red))
+            Text(success
+                 ? "Terminé. Fichiers générés dans le dossier de sortie."
+                 : (interrompu
+                    ? "Traitement interrompu. Relancez pour reprendre : ce qui était déjà transcrit est conservé."
+                    : "Le traitement a échoué — voir le journal ci-dessus."))
             Spacer()
             if success, let folder = runner.outputFolder {
                 Button("Révéler dans le Finder") {
@@ -296,7 +367,16 @@ struct ContentView: View {
                 }
                 .disabled(summaryRunner.state == .running)
 
-                Text("Analyse locale via Ollama + Mistral")
+                if summaryRunner.state == .running {
+                    Button("Interrompre") {
+                        summaryRunner.cancel()
+                    }
+                    .tint(.red)
+                    .help("Arrête la génération du résumé sans quitter l'application. "
+                          + "Le transcript, lui, n'est pas touché.")
+                }
+
+                Text("Analyse locale via Ollama")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -325,9 +405,14 @@ struct ContentView: View {
 
             if case .finished(let success) = summaryRunner.state {
                 HStack {
-                    Image(systemName: success ? "checkmark.circle.fill" : "xmark.circle.fill")
-                        .foregroundStyle(success ? .green : .red)
-                    Text(success ? "Résumé structuré généré." : "Échec de la génération du résumé — voir le journal ci-dessus.")
+                    Image(systemName: success ? "checkmark.circle.fill"
+                          : (summaryRunner.interrompu ? "stop.circle.fill" : "xmark.circle.fill"))
+                        .foregroundStyle(success ? .green : (summaryRunner.interrompu ? .orange : .red))
+                    Text(success
+                         ? "Résumé structuré généré."
+                         : (summaryRunner.interrompu
+                            ? "Génération du résumé interrompue."
+                            : "Échec de la génération du résumé — voir le journal ci-dessus."))
                     Spacer()
                     if success, let md = summaryRunner.resumeMarkdownPath {
                         Button("Ouvrir le résumé") {
@@ -524,6 +609,16 @@ struct ContentView: View {
         } else {
             contextText = ""
         }
+        // Les catégories suivent le même chemin que le contexte. Absentes,
+        // on remet la grille par défaut plutôt que de laisser celles de la
+        // session précédente, qui n'ont rien à voir avec celle-ci.
+        if let categoriesFile = findFile(in: dossierDeSortie, suffix: "_categories.txt"),
+           let text = try? String(contentsOf: categoriesFile, encoding: .utf8),
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            categoriesText = text
+        } else {
+            categoriesText = ContentView.defaultCategoriesText
+        }
         numSpeakersText = ""
 
         resumeBanner = nil
@@ -613,6 +708,7 @@ struct ContentView: View {
             ("_speakers.json", "fiche locuteurs"),
             ("_whisper_raw.json", "cache de transcription"),
             ("_contexte.txt", "contexte"),
+            ("_categories.txt", "catégories du résumé"),
             ("_review_audio.wav", "audio de relecture"),
         ]
         let presents = connus.filter { findFile(in: dossierDeSortie, suffix: $0.0) != nil }
@@ -657,6 +753,10 @@ struct ContentView: View {
             sessionError = "Transcript introuvable dans « \(outputFolder.lastPathComponent) »."
             return
         }
+        // Réécrit avant chaque résumé : les catégories sont souvent ajustées
+        // après la transcription, et le dossier doit refléter celles qui ont
+        // réellement produit le résumé qu'il contient.
+        ecrireFichiersDeSession(dans: outputFolder, pour: audioURL)
         summaryRunner.run(transcriptPath: input, settings: settings, categoriesArgument: categoriesArgument(from: categoriesText), context: contextText)
     }
 
@@ -716,6 +816,43 @@ struct ContentView: View {
         let numSpeakers = Int(numSpeakersText.trimmingCharacters(in: .whitespaces))
         let outputFolder = settings.outputFolder(for: audioURL)
         try? FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
+        ecrireFichiersDeSession(dans: outputFolder, pour: audioURL)
         runner.run(audioURL: audioURL, settings: settings, numSpeakers: numSpeakers, outputFolder: outputFolder, context: contextText)
     }
+
+    /// Écrit le contexte et les catégories à côté des résultats, en texte brut.
+    ///
+    /// Ces deux réglages appartiennent à la session, pas à l'application : ils
+    /// décrivent CETTE réunion — ses participants, ses sigles, les rubriques
+    /// qu'on veut en tirer. Les garder dans les préférences de l'app faisait
+    /// qu'ouvrir une autre session montrait le contexte de la précédente, et
+    /// qu'un dossier de résultats transmis à quelqu'un d'autre arrivait sans
+    /// ce qui permet de le relire. En fichiers texte, ils voyagent avec le
+    /// dossier et s'éditent sans l'application.
+    private func ecrireFichiersDeSession(dans dossier: URL, pour audioURL: URL) {
+        let basename = audioURL.deletingPathExtension().lastPathComponent
+        let aEcrire: [(String, String)] = [
+            ("_contexte.txt", contextText),
+            ("_categories.txt", categoriesText),
+        ]
+        for (suffixe, contenu) in aEcrire {
+            let url = dossier.appendingPathComponent("\(basename)\(suffixe)")
+            let propre = contenu.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !propre.isEmpty else { continue }
+            try? (propre + "\n").write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+}
+
+
+/// Actions de la fenêtre principale déclenchables depuis le menu.
+///
+/// Passer par une notification plutôt que par un état partagé : ces actions
+/// vivent dans ContentView (elles manipulent son état de session), alors que
+/// les menus sont déclarés au niveau de l'application. Une notification est
+/// le chemin le plus court entre les deux, sans faire remonter de l'état qui
+/// n'a aucune raison de quitter la vue.
+extension Notification.Name {
+    static let ttrOuvrirSessionExistante = Notification.Name("ttrOuvrirSessionExistante")
+    static let ttrOuvrirReglages = Notification.Name("ttrOuvrirReglages")
 }
