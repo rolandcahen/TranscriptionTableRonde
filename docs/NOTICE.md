@@ -1,6 +1,6 @@
 # Notice d'utilisation — Transcription Table Ronde
 
-*Application version 1.0 — notice mise à jour le 30 septembre 2026. Ce
+*Application version 1.1 — notice mise à jour le 7 octobre 2026. Ce
 document suit l'évolution de l'application ; les captures d'écran seront
 ajoutées manuellement.*
 
@@ -241,9 +241,60 @@ La transcription est écrite sur disque dès la fin de l'étape 1, dans un
 fichier `<nom>_whisper_raw.json`. Si la diarisation échoue ou si vous
 interrompez le traitement, la transcription est acquise : la relance repart
 directement à l'étape 2. Ce cache n'est réutilisé que si l'audio, le modèle,
-la langue et le contexte sont inchangés — modifier l'un d'eux refait la
-transcription. Effet utile : relancer avec un nombre de locuteurs différent
-ne recalcule que la diarisation.
+la langue, le contexte **et les réglages de décodage** sont inchangés —
+modifier l'un d'eux refait la transcription. Effet utile : relancer avec un
+nombre de locuteurs différent ne recalcule que la diarisation.
+
+### Pourquoi Whisper ne réinjecte plus son propre texte
+
+Par défaut, Whisper reprend le texte déjà transcrit comme contexte de la
+fenêtre suivante. Ce mécanisme améliore la cohérence d'une fenêtre à
+l'autre, mais c'est aussi lui qui permet au modèle de se bloquer en boucle
+de répétition et de propager une invention sur plusieurs minutes.
+
+Mesuré sur un extrait de dix minutes : avec la réinjection, **258 mots
+inventés en boucle, dont 216 sur un seul segment** — et ces 216 mots
+remplaçaient la parole réelle du passage. Sans elle, aucune boucle, et la
+part de temps signalée comme douteuse tombe de 16,8 % à 7,9 %.
+
+La réinjection est donc **désactivée par défaut** depuis la version 1.1.
+`--condition-on-previous-text` la rétablit si la cohérence des noms propres
+d'une fenêtre à l'autre compte plus, pour vous, que la robustesse.
+
+### Ce que l'application sait de sa propre fiabilité
+
+Trois indicateurs sont calculés pour chaque segment, sans aucun coût de
+calcul supplémentaire — ils étaient déjà dans la sortie de pyannote, et
+l'alignement les jetait :
+
+- **netteté d'attribution** — parmi la parole détectée dans ce segment,
+  quelle part revient au locuteur retenu. 100 % signifie qu'il est seul à
+  parler. Une valeur basse signale soit un segment à cheval sur deux tours
+  successifs, soit une parole réellement simultanée ;
+- **part de parole** — quelle fraction de la durée du segment contient de la
+  parole détectée. Un segment porteur de texte mais sans aucune parole
+  détectée est le signe le plus solide d'une invention de Whisper, parce que
+  deux modèles indépendants s'y contredisent ;
+- **taux de chevauchement** — part du segment où au moins deux personnes
+  parlent en même temps.
+
+Ces deux dernières distinctions comptent, car elles n'appellent pas le même
+remède. Un segment à cheval se répare en le coupant ; deux voix superposées
+ne se réparent pas du tout dans un enregistrement mono, et la réponse est à
+la prise de son.
+
+`pipeline/diagnostic_attribution.py` relit un transcript déjà produit et en
+donne la distribution, sans refaire aucun calcul :
+
+```bash
+cd ~/transcription_pipeline
+venv/bin/python3 diagnostic_attribution.py ~/chemin/sortie_reunion
+```
+
+Il sépare ce qui relève de l'attribution des locuteurs de ce qui relève de
+la transcription, et liste les segments les moins nets avec leur
+horodatage — confondre les deux familles fait chercher du côté de la
+diarisation ce qui vient de Whisper, et réciproquement.
 
 À partir de là, deux étapes optionnelles, dans l'ordre que l'on souhaite :
 
@@ -265,6 +316,16 @@ l'enregistrement. Ce texte sert à deux choses :
 - il est réutilisé comme base pour le résumé structuré, afin que Mistral
   comprenne le sujet et les rôles des intervenants.
 
+Depuis la version 1.1, **le contexte et les catégories du résumé sont
+écrits en fichiers texte dans le dossier de la session** —
+`<nom>_contexte.txt` et `<nom>_categories.txt` — et relus à son ouverture.
+Ils décrivent cette réunion-là, ses participants, ses sigles, les rubriques
+qu'on veut en tirer : les garder dans les préférences de l'application
+faisait qu'ouvrir une autre session montrait le contexte de la précédente,
+et qu'un dossier de résultats transmis à quelqu'un d'autre arrivait sans ce
+qui permet de le relire. En fichiers texte, ils voyagent avec le dossier et
+s'éditent sans l'application.
+
 **Limite à connaître** : le contexte oriente la reconnaissance mais ne
 garantit pas une correction systématique — un homophone parfait comme « Cor
 des Alpes » / « corps des Alpes » peut encore apparaître dans le transcript
@@ -282,7 +343,20 @@ lui-même dans sa synthèse.
 
 - **Zone de dépôt** — glisser un fichier audio (`.wav`, `.mp3`, et autres
   formats courants) ou cliquer pour en choisir un via le sélecteur de
-  fichiers.
+  fichiers. Volontairement basse : elle n'affiche qu'une ligne.
+- **Lecteur de vérification** — apparaît dès qu'un fichier est chargé :
+  lecture, pause, barre de progression, temps écoulé, et surtout une ligne
+  de caractéristiques lue dans le fichier — « WAV · 48 kHz · stéréo ·
+  1 h 47 ». C'est elle qui attrape les erreurs que l'oreille ne relève pas
+  tout de suite : le mauvais fichier, un enregistrement tronqué, ou un
+  fichier de secours échantillonné sous 16 kHz qui dégraderait toute la
+  transcription sans qu'on comprenne pourquoi en la relisant. Ces deux
+  derniers cas déclenchent un avertissement orange.
+
+  *Pas de forme d'onde* : sur de la parole continue à niveau constant, elle
+  ne montrerait qu'un aplat uniforme. La structure de l'enregistrement se
+  lit bien mieux dans la fenêtre de vérification, qui en donne le découpage
+  par locuteurs.
 - **Contexte** (optionnel) — zone de texte dépliable, voir
   [3.1](#le-champ--contexte-).
 - **Modèle** — choix du modèle mlx-whisper (`large-v3-turbo` par défaut,
@@ -294,13 +368,25 @@ lui-même dans sa synthèse.
 - **Bouton « Transcrire »** — lance le traitement (raccourci `⌘⏎`).
   Désactivé tant qu'aucun fichier n'est choisi ou que le token Hugging Face
   manque.
+- **Bouton « Interrompre »** (rouge, `⌘.`) — n'apparaît que pendant un
+  traitement et l'arrête sans quitter l'application. Le bandeau distingue
+  alors une interruption d'un échec : ce qui était déjà transcrit est
+  conservé, et une relance sur le même fichier reprend à la diarisation. Un
+  bouton équivalent existe pour la génération du résumé.
 - **Barre de progression** — indique l'étape en cours (1/3 Transcription,
   2/3 Diarisation, 3/3 Fusion) avec un pourcentage pour les deux premières.
   L'étape 2 précise en outre la phase interne de pyannote en cours
   (segmentation de la parole, empreintes vocales, comptage des locuteurs,
   assemblage). Seule l'étape 3, très brève, reste sans pourcentage.
 - **Journal** — sortie texte détaillée du traitement en cours, copiable via
-  le bouton « Copier le journal ».
+  le bouton « Copier le journal ». Replié par défaut dans un onglet, comme
+  Contexte et Catégories ; refermé, son en-tête affiche la dernière ligne
+  produite, pour qu'il ne laisse jamais croire que rien ne se passe.
+
+Toute la page défile verticalement, avec un ascenseur visible en
+permanence : avec les trois onglets dépliés, le contenu dépasse la hauteur
+de la fenêtre, et il doit rester possible d'atteindre le bas — journal et
+bandeau de fin compris.
 - **Bandeau de résultat** — une fois terminé, accès direct au dossier de
   sortie via « Révéler dans le Finder ».
 
@@ -321,15 +407,20 @@ l'application. Si un traitement avait été interrompu en cours de route, un
 bandeau bleu le signale au lieu de laisser croire qu'il s'est terminé.
 
 En haut à droite du titre figurent les signatures institutionnelles du
-projet : Centre de Recherche en Design (ENSCI-Les Ateliers / ENS
-Paris-Saclay), École normale supérieure Paris-Saclay, et Comprehensive
-Sepsis Center.
+projet : ENSCi-Les Ateliers, Centre de Recherche en Design (ENSCI-Les
+Ateliers / ENS Paris-Saclay), École normale supérieure Paris-Saclay, et
+Comprehensive Sepsis Center. Chaque logo a sa hauteur propre, calibrée à
+l'œil et non géométriquement : à hauteur égale, les blocs typographiques
+deviendraient des textures illisibles.
 
-Barre d'outils (en haut à droite de la fenêtre), trois icônes :
+Barre d'outils (en haut à droite de la fenêtre), trois boutons portant leur
+nom à côté de leur icône — **Lots**, **Ouvrir**, **Réglages**. Les trois
+mêmes actions figurent aussi dans le menu **Traitement**, avec leurs
+raccourcis (`⇧⌘L`, `⌘O`, `⌘,`) : une icône se devine, un menu se lit.
 
-- 🗂️ (plateau) — ouvre la fenêtre de traitement par lots
+- **Lots** — ouvre la fenêtre de traitement par lots
   ([4.4](#44-fenêtre-traitement-par-lots)).
-- 🕐 (horloge) — ouvre une session déjà traitée sans refaire la
+- **Ouvrir** — ouvre une session déjà traitée sans refaire la
   transcription. Trois gestes fonctionnent indifféremment : désigner le
   dossier `sortie_…`, désigner n'importe quel fichier qu'il contient, ou
   désigner l'enregistrement d'origine. L'application remonte la session
@@ -342,16 +433,35 @@ Barre d'outils (en haut à droite de la fenêtre), trois icônes :
   se rabat sur l'audio de relecture `<nom>_review_audio.wav` conservé dans
   le dossier : une session transmise par un collègue reste donc corrigeable
   sans l'enregistrement d'origine.
-- ⚙️ (roue crantée) — ouvre les Réglages.
+- **Réglages** — ouvre les Réglages.
 
 ### 4.2 Fenêtre Réglages
 
-Accessible à tout moment via `⌘,` ou l'icône ⚙️. Voir
+Accessible à tout moment via `⌘,`, le bouton **Réglages** ou le menu
+*Traitement*. La fenêtre est redimensionnable horizontalement et s'ouvre
+assez large pour que les chemins se lisent en entier : c'est leur
+illisibilité qui permettait de confondre deux réglages voisins et de coller
+un dossier de sortie à la place du dossier du pipeline.
+
+**Chaque chemin porte son verdict**, recalculé à la frappe. Le dossier du
+pipeline n'est vert que si `transcribe_diarize.py` **et** `summarize.py` s'y
+trouvent réellement, et nomme sinon celui qui manque. L'interpréteur Python
+distingue l'absence, le dossier pris pour le fichier, et le fichier non
+exécutable. Les dossiers de travail laissés vides ne disent rien — c'est un
+réglage légitime, pas une anomalie.
+
+Et avant tout lancement, l'application vérifie que l'installation existe :
+plutôt que de laisser passer un « No such file or directory » de Python, le
+journal nomme le champ des Réglages à corriger.
+
+Voir
 [« Configuration au premier lancement »](#configuration-au-premier-lancement)
 pour le détail des champs techniques (dossier du pipeline, interpréteur
 Python, token Hugging Face).
 
-Deux réglages de dossiers, dans la section **Fichiers** :
+Deux réglages de dossiers, dans la section **Dossiers de travail** — à ne
+pas confondre avec la section **Pipeline Python (installation)**, qui
+désigne l'emplacement du logiciel et non celui des données :
 
 - **Dossier des enregistrements** — emplacement où s'ouvrent par défaut les
   sélecteurs de fichiers et de dossiers. Purement pratique : il évite de
@@ -388,7 +498,25 @@ du précédent.)
 à toute la fenêtre, avec boutons lecture / pause / stop et affichage du
 temps écoulé. Le bouton de chaque segment fonctionne en bascule : il
 positionne la lecture au début du segment et démarre, puis arrête si on le
-recliquent pendant que ce segment joue — son icône passe de ▶ à ⏹.
+reclique pendant que ce segment joue — son icône passe de ▶ à ⏹.
+
+**Lire au curseur (`⌘⏎`)** : reprend la lecture à l'endroit exact où se
+trouve le curseur dans le texte d'un segment. C'est la commande qui rend
+praticable la correction d'un gros bloc : on clique dans la phrase
+douteuse, on réécoute juste ce passage. Le raccourci fonctionne pendant la
+frappe.
+
+**Barre d'espace** : même bascule lecture/pause, mais **hors** d'une zone de
+texte — dans une zone de texte, elle doit taper une espace, sinon on ne peut
+plus écrire. Cliquez dans le fond de la liste et elle répond.
+
+**Suivi de la lecture dans le texte** : le mot en cours est surligné dans le
+cartouche du segment qui joue. La correspondance entre un instant du son et
+une position dans le texte est **proportionnelle à la longueur du texte** :
+elle suppose un débit régulier, ce qui est faux dans le détail, mais permet
+de retomber à quelques secondes près dans un bloc de deux cents mots. Le mot
+entier est surligné plutôt que le caractère calculé, pour ne pas donner une
+fausse impression de précision.
 
 À la première ouverture d'une session, l'application prépare pendant
 quelques secondes un fichier `<nom>_review_audio.wav` : une copie normalisée
@@ -410,15 +538,48 @@ de ce locuteur à la fois.
   quand la diarisation automatique s'est trompée) ;
 - **indice de confiance en pourcentage**, dans l'en-tête du cartouche, dans
   la teinte correspondante — voir l'encadré ci-dessous ;
-- icône ⚠️ **suivie de sa raison en clair** si le segment est signalé :
-  confiance faible, silence probable, mot répété, segment anormalement long
-  (plus de 30 secondes) ou anormalement court (moins de 0,3 seconde) ;
+- **pastille orange d'attribution partagée**, cliquable, du type
+  « 53 % · ou Dominique ? », quand la parole du segment se partage entre
+  deux locuteurs. Un clic réattribue le segment à l'autre candidat, et
+  l'annulation fonctionne dessus. L'icône distingue les deux situations :
+  deux silhouettes quand les locuteurs se succèdent — la coupure est au
+  mauvais endroit, réattribuer ou diviser règle l'affaire — et une forme
+  d'onde barrée quand ils parlent réellement en même temps, auquel cas c'est
+  le texte lui-même qui est douteux et aucun clic n'y changera rien ;
+- icône ⚠️ **suivie de sa raison en clair** si le segment est signalé. La
+  raison vient du pipeline quand elle existe — « la diarisation ne trouve
+  aucune parole sur ce passage » croise deux modèles indépendants, ce
+  qu'aucune heuristique interne à l'application ne pourrait faire — et des
+  heuristiques locales pour les transcripts plus anciens : confiance faible,
+  silence probable, mot répété, segment anormalement long ou court.
+
+  **Ces indicateurs disparaissent dès que vous corrigez le segment.** Un
+  segment dont vous venez de rectifier le locuteur ou le texte n'est plus
+  décrit par des mesures calculées avant votre correction : les laisser
+  ferait réapparaître l'alerte sur un segment devenu juste ;
 - texte éditable, sur fond coloré selon la confiance, **dimensionné à la
   hauteur de son contenu** : un segment long s'affiche en entier, sans
   défilement interne ;
+- bouton ✂️ **toujours actif** pour diviser le segment — voir ci-dessous ;
 - bouton 🗑️ pour supprimer un segment erroné, bouton « + Ajouter un
   segment » (en haut) pour en créer un manuellement au point de lecture
   actuel.
+
+**Diviser un segment où deux personnes parlent à la suite.** Trois gestes,
+au choix, et les ciseaux ✂️ restent toujours cliquables :
+
+- **au tiret de dialogue** — passez à la ligne au changement de locuteur et
+  commencez par un tiret, comme dans un texte dialogué. Trait d'union, tiret
+  demi-cadratin et cadratin sont acceptés, le tiret peut être indenté. Il
+  doit être suivi d'une espace, faute de quoi une ligne commençant par
+  « -5 % » serait coupée en deux ;
+- **au marqueur `|`** — tapé directement à l'endroit du changement ;
+- **à la position du curseur** — si le texte ne contient ni tiret ni
+  marqueur, les ciseaux coupent simplement là où vous avez cliqué.
+
+Dans les trois cas, la durée est répartie entre les morceaux au prorata de
+la longueur de leur texte, et les horodatages restent modifiables ensuite.
+L'infobulle des ciseaux change selon ce que le bouton va réellement faire.
 
 **Ce que signifie le pourcentage de confiance.** C'est l'exponentielle de
 l'`avg_logprob` de Whisper, c'est-à-dire la probabilité moyenne que le
@@ -541,27 +702,88 @@ brancher un écran externe.
 ## 5. Le résumé structuré
 
 Une fois un transcript disponible (brut ou corrigé), le bouton « Générer le
-résumé structuré » lance une analyse locale via Ollama et le modèle
-Mistral. Le transcript est découpé en tranches d'environ 3000 mots, chaque
-tranche est résumée, puis les résumés partiels sont fusionnés et organisés
-selon les catégories définies.
+résumé structuré » lance une analyse locale via Ollama. Le modèle par défaut
+est `mistral-small3.2:24b` : un modèle de 24 milliards de paramètres lit le
+français avec beaucoup plus de finesse qu'un 7B, et c'est le premier facteur
+de qualité. `--model mistral` revient à un modèle plus léger si la mémoire
+manque.
 
-Catégories par défaut (modifiables dans la zone dépliable « Catégories du
-résumé », une par ligne) :
+### Trois passes, et pourquoi
 
-- État de la recherche
-- Questions posées
-- Réponses apportées
+**1. Relevé de notes.** La première passe ne rédige pas, elle relève : une
+liste de notes typées — position défendue, désaccord, question restée
+ouverte, décision, action, terme ambigu, moment de bascule — chacune avec
+son horodatage et le ou les locuteurs concernés. Un modèle de cette taille
+s'en sort bien mieux à relever qu'à résumer, et la passe suivante a dès lors
+des prises pour ranger plutôt que de reparaphraser un texte déjà appauvri.
+
+L'attribution est demandée explicitement : « Untel soutient que », « Untel
+objecte que », jamais un « les participants » collectif — c'est ce qui
+faisait disparaître la substance d'une table ronde. Un nom de locuteur qui
+n'apparaît pas réellement dans la tranche est écarté.
+
+**2. Rangement avec citations vérifiées.** La seconde passe range les notes
+dans les catégories, et **cite pour chaque item les identifiants des notes
+dont il découle**. Ces citations sont résolues par le programme, pas par le
+modèle : un item qui ne cite rien, ou qui cite un identifiant inexistant,
+part dans une section « À vérifier — points sans source identifiable » au
+lieu d'être affirmé. Un modèle qui invente cite mal, et cela se détecte sans
+un seul appel supplémentaire. Les horodatages et les noms de locuteurs des
+items sont déduits des notes citées : eux non plus ne peuvent pas être
+inventés.
+
+**3. Synthèse d'ouverture.** Le document s'ouvre sur une section « En bref »
+de deux à dix lignes, en prose continue, sans horodatage — pour qui veut
+savoir en trente secondes ce qui s'est joué. Elle est rédigée **à partir du
+compte rendu retenu**, et non des notes brutes : ce qui a été écarté faute
+de source ne peut donc pas revenir par la porte de derrière. `--sans-synthese`
+la supprime si seul le corps vous intéresse.
+
+### Les grilles de lecture
+
+La grille par défaut est **analytique** : elle demande ce qui ne se lit pas
+directement dans le transcript.
+
+- Positions défendues, et par qui
+- Désaccords et tensions non résolus
+- Questions restées sans réponse
+- Décisions prises
+- Actions à mener
 - Difficultés mises en avant
 - Propositions de développement
-- Implications techniques
-- Implications financières
-- Autres éléments pertinents
+- Implications techniques et financières
+- Termes employés dans des sens différents selon les participants
+- Moments où la discussion change de nature
+
+La grille **descriptive** reprend les huit catégories factuelles d'origine
+(état de la recherche, questions posées, réponses apportées, etc.) :
+`--grille descriptive`. Et la zone dépliable « Catégories du résumé » de
+l'application reste prioritaire sur les deux, une catégorie par ligne.
+
+La profondeur que l'ancienne version ne donnait pas n'était pas une affaire
+de modèle : l'ancienne grille ne la demandait pas.
+
+### Réserves et traçabilité
+
+Un item qui s'appuie sur un passage que le pipeline a signalé — parole
+superposée, segment douteux — porte un avertissement dans le document.
+L'incertitude de la transcription remonte ainsi jusqu'au résumé au lieu de
+se perdre en chemin.
+
+Chaque point porte l'horodatage des passages dont il découle : ouvrez la
+session dans l'application et écoutez-les pour vérifier, corriger ou
+préciser. C'est ce qui permet de contrôler une affirmation en dix secondes
+au lieu de rouvrir tout l'enregistrement.
 
 Deux fichiers sont générés dans le dossier de sortie : un `.md` (Markdown,
 lisible directement, ouvert via le bouton « Ouvrir le résumé ») et un
-`.json` (structuré, réutilisable par un outil externe pour croiser plusieurs
-enregistrements).
+`.json`, qui contient en plus la synthèse, toutes les notes relevées et les
+citations de chaque item — de quoi reconstruire le raisonnement ou croiser
+plusieurs enregistrements avec un outil externe.
+
+La console rend compte de l'attente au fil de l'eau : avec un modèle de
+cette taille, une tranche prend plusieurs minutes, et un affichage muet
+laisserait croire à un blocage.
 
 ## 6. Exporter vers un tableur
 
@@ -602,6 +824,29 @@ parmi 24 contrôles, et peut être relancé à tout moment.
 
 ## 7. Limitations connues
 
+- **La parole simultanée ne se sépare pas.** Quand deux personnes parlent en
+  même temps dans un enregistrement mono, aucun traitement ne démêle les
+  voix, et le texte produit sur ces passages est au mieux approximatif.
+  L'application les signale plutôt que de prétendre le contraire. La réponse
+  n'est pas logicielle : un micro par participant sur un enregistreur
+  multipiste rend la diarisation triviale, puisque le locuteur est alors
+  connu par construction.
+- **Pas d'horodatage mot à mot.** Ce serait la bonne façon de couper un
+  segment au mot près et de suivre la lecture exactement. Mesuré sur cette
+  machine, il multiplie par vingt le temps de transcription — vingt minutes
+  pour dix minutes d'audio, contre cinquante-sept secondes. Écarté pour
+  cette raison. La correspondance entre une position dans le texte et un
+  instant du son reste donc proportionnelle, et approximative de quelques
+  secondes.
+- **Le modèle `large-v3` est hors d'usage à ce volume.** Plus précis que
+  `large-v3-turbo` sur l'audio difficile, mais vingt fois plus lent sur
+  cette machine : soixante heures de calcul pour trente heures
+  d'enregistrement. L'option reste disponible pour un extrait court.
+- **« Aucune parole détectée » ne distingue pas deux cas.** Un segment
+  porteur de texte là où pyannote n'entend personne peut être une invention
+  de Whisper sur du bruit, ou une courte réplique réelle que la diarisation
+  a manquée. Les deux produisent exactement le même signal, et seule une
+  écoute tranche. L'application pointe l'endroit, elle ne décide pas.
 - **Pas de `.dmg` packagé ni de signature par un compte développeur Apple
   payant** — l'installation automatique ([2.0](#20-installation-automatique-recommandé))
   compile depuis le code source avec une signature ad-hoc (usage local),
@@ -626,9 +871,12 @@ parmi 24 contrôles, et peut être relancé à tout moment.
 - **L'avancement des corrections ne se partage pas encore** — l'état de la
   session est mémorisé par machine et par compte, pas dans le dossier de
   sortie. Copier ou synchroniser un dossier `sortie_…` transmet les
-  transcripts et les corrections déjà enregistrées, mais pas l'état de
-  travail. Un correcteur qui reprend le dossier repart donc de ce qui a été
-  écrit sur disque.
+  transcripts, les corrections déjà enregistrées, le contexte et les
+  catégories, mais pas l'état de travail. Un correcteur qui reprend le
+  dossier repart donc de ce qui a été écrit sur disque.
+- **Le journal défile dans une page qui défile** — quand le pointeur est
+  au-dessus du journal, la molette fait défiler le journal ; il faut la
+  déplacer sur le reste de la page pour faire défiler la fenêtre.
 - **Pas de mise à jour automatique** — toute nouvelle version doit être
   réinstallée manuellement : `git pull` (ou nouveau téléchargement du zip)
   puis relancer `TranscriptionTableRonde_install.sh`, qui écrase l'ancienne
@@ -644,4 +892,15 @@ parmi 24 contrôles, et peut être relancé à tout moment.
 - **Contexte** — texte libre décrivant le sujet/les participants d'un
   enregistrement, utilisé pour améliorer la reconnaissance et le résumé.
 - **Résumé structuré** — synthèse organisée par catégories, générée
-  localement par un modèle de langage (Mistral via Ollama).
+  localement par un modèle de langage (via Ollama). Chaque point cite les
+  passages dont il découle.
+- **Netteté d'attribution** — part de la parole détectée dans un segment qui
+  revient au locuteur retenu. Mesure l'ambiguïté, non la qualité du texte.
+- **Chevauchement** — part d'un segment où au moins deux personnes parlent
+  en même temps. Irréductible dans un enregistrement mono.
+- **Hallucination** — texte plausible produit par Whisper là où il n'y a pas
+  de parole. Détectable quand la diarisation, modèle indépendant, n'entend
+  personne sur le même passage.
+- **Boucle de répétition** — blocage de Whisper sur un mot ou une formule
+  qu'il répète des dizaines de fois, généralement sur du silence ou du
+  bruit. Repliée automatiquement, et l'original reste dans le cache.
