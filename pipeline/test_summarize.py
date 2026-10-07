@@ -18,8 +18,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from summarize import (
     GRILLE_ANALYTIQUE, GRILLE_DESCRIPTIVE, chunk_blocks, ecrire_markdown,
-    fiabilite, fmt_ts, load_blocks, lire_flux, parse_categories, parse_notes,
-    parse_ts, ranger,
+    fiabilite, fmt_ts, load_blocks, lire_flux, nettoyer_synthese,
+    parse_categories, parse_notes, parse_ts, ranger,
 )
 
 ok = True
@@ -211,6 +211,54 @@ check("le découpage respecte la taille demandée",
 check("et ne fabrique pas de tranches inutilement petites",
       len(tranches) == 5, str([len(t) for t in tranches]))
 check("aucun bloc n'est perdu au découpage", sum(len(t) for t in tranches) == 10)
+
+print("\n== synthèse d'ouverture ==")
+
+# La synthèse a une règle simple — de la prose, sans horodatage — et le
+# modèle la transgresse de trois façons prévisibles. Ces tests fixent le
+# rattrapage, parce que redemander coûterait des minutes pour un résultat
+# tout aussi incertain.
+t = nettoyer_synthese("La séance a porté sur le calendrier [00:12:30] et le budget.")
+check("les horodatages entre crochets disparaissent", "00:12:30" not in t and "[" not in t, t)
+
+t = nettoyer_synthese("Roland propose `01:02:03` de partir du terrain.")
+check("ceux entre accents graves aussi", "01:02:03" not in t and "`" not in t, t)
+
+t = nettoyer_synthese("Le point a été tranché à 14:05 sans opposition.")
+check("et les horodatages nus", "14:05" not in t, t)
+
+t = nettoyer_synthese("- Premier point.\n- Deuxième point.")
+check("les puces redeviennent de la prose continue",
+      t == "Premier point. Deuxième point.", repr(t))
+
+t = nettoyer_synthese("Voici la synthèse :\nLa séance a été brève.")
+check("le préambule est retiré", t == "La séance a été brève.", repr(t))
+
+t = nettoyer_synthese("## Synthèse\nLa séance a été brève.")
+check("les titres parasites aussi", t == "Synthèse La séance a été brève.", repr(t))
+
+t = nettoyer_synthese("Une   phrase    espacée.\n\n\nPuis une autre.")
+check("les espaces et lignes vides sont normalisés",
+      t == "Une phrase espacée. Puis une autre.", repr(t))
+
+check("une réponse vide reste vide", nettoyer_synthese("   \n\n  ") == "")
+
+t = nettoyer_synthese("Le budget de 2026 atteint 12 500 euros pour 3 ateliers.")
+check("les nombres ordinaires ne sont pas pris pour des horodatages",
+      "12 500" in t and "2026" in t and "3 ateliers" in t, t)
+
+print("\n== le markdown avec et sans synthèse ==")
+md_s = tmp / "avec_synthese.md"
+ecrire_markdown("reunion", resultat, ecartes, CATEGORIES, NOTES, md_s,
+                "La séance a surtout porté sur la méthode.")
+texte_s = md_s.read_text(encoding="utf-8")
+check("la synthèse ouvre le document",
+      texte_s.index("## En bref") < texte_s.index("## Positions"), "ordre des sections")
+check("son texte y figure", "surtout porté sur la méthode" in texte_s)
+
+md_ns = tmp / "sans_synthese.md"
+ecrire_markdown("reunion", resultat, ecartes, CATEGORIES, NOTES, md_ns)
+check("sans synthèse, pas de section « En bref »", "## En bref" not in md_ns.read_text(encoding="utf-8"))
 
 print("\n== lecture du flux Ollama ==")
 

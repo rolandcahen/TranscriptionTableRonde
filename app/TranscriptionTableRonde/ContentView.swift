@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import AVFoundation
 import UniformTypeIdentifiers
 
 struct ContentView: View {
@@ -48,9 +49,34 @@ struct ContentView: View {
     """
 
     var body: some View {
+        // Toute la page défile.
+        //
+        // Elle ne le faisait pas avant parce que la fenêtre était contrainte
+        // à la taille exacte de son contenu : il tenait donc toujours, au
+        // prix d'une fenêtre non redimensionnable. En rendant celle-ci
+        // étirable, j'ai supprimé cette garantie sans la remplacer — et dès
+        // que les trois onglets étaient dépliés, le bas de la page, journal
+        // compris, devenait tout simplement inatteignable.
+        ScrollView(.vertical) {
+            contenu
+        }
+        .scrollIndicators(.visible)
+        .onReceive(NotificationCenter.default.publisher(for: .ttrOuvrirSessionExistante)) { _ in
+            openExistingSession()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .ttrOuvrirReglages)) { _ in
+            openSettings()
+        }
+    }
+
+    private var contenu: some View {
         VStack(alignment: .leading, spacing: 16) {
             header
             dropZone
+
+            if let audioURL {
+                LecteurAudio(url: audioURL)
+            }
 
             DisclosureGroup("Contexte (optionnel)") {
                 VStack(alignment: .leading, spacing: 2) {
@@ -126,15 +152,9 @@ struct ContentView: View {
                 summarySection(audioURL: audioURL, outputFolder: outputFolder)
             }
 
-            // Journal replié : rien dans la vue n'est élastique, la place en
-            // trop doit donc aller quelque part — ici, sous le dernier
-            // élément. Journal déplié : c'est lui qui s'étire, et ce ressort
-            // lui disputerait l'espace sans raison.
-            if !journalOuvert {
-                Spacer(minLength: 0)
-            }
         }
         .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear {
             // Le gestionnaire de file par lots est partagé au niveau de
             // l'app (voir TranscriptionTableRondeApp.swift) : la reprise
@@ -159,40 +179,44 @@ struct ContentView: View {
             Text(sessionError ?? "")
         }
         .toolbar {
+            // Deux mécanismes, parce que le premier a échoué deux fois.
+            //
+            // `.help` sur un bouton de barre d'outils n'a produit aucune
+            // infobulle, ni sur une Image nue ni sur un Label masqué. Plutôt
+            // que de continuer à deviner, l'infobulle est maintenant posée
+            // directement sur une vue AppKit — là, c'est le système qui
+            // l'affiche, et son comportement est connu.
+            //
+            // Et le titre devient visible à côté de l'icône. Une infobulle
+            // qui ne s'affiche pas n'est pas une fonctionnalité ; un libellé
+            // qu'on lit sans survoler ne peut pas, lui, ne pas marcher.
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     openBatchQueueWindow()
                 } label: {
-                    Image(systemName: "tray.full")
+                    Label("Lots", systemImage: "tray.full")
                 }
-                .help("Traitement par lots (dossier entier)")
+                .infobulle("Traitement par lots (⇧⌘L) : transcrire tout un dossier "
+                           + "d'enregistrements à la suite.")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     openExistingSession()
                 } label: {
-                    Image(systemName: "clock.arrow.circlepath")
+                    Label("Ouvrir", systemImage: "clock.arrow.circlepath")
                 }
-                .help("Ouvrir une session déjà traitée : choisissez son dossier « sortie_… », un fichier qu'il contient, ou l'enregistrement d'origine.")
+                .infobulle("Ouvrir une session déjà traitée (⌘O) : son dossier « sortie_… », "
+                           + "un fichier qu'il contient, ou l'enregistrement d'origine.")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     openSettings()
                 } label: {
-                    Image(systemName: "gearshape")
+                    Label("Réglages", systemImage: "gearshape")
                 }
-                .help("Réglages (⌘,) : dossiers de travail, emplacement du pipeline Python, "
-                      + "interpréteur et token Hugging Face.")
+                .infobulle("Réglages (⌘,) : dossiers de travail, emplacement du pipeline "
+                           + "Python, interpréteur et token Hugging Face.")
             }
-        }
-        // Les mêmes trois actions, atteignables au menu : une icône sans
-        // libellé se devine, un menu se lit — et se cherche là où on a
-        // l'habitude de chercher.
-        .onReceive(NotificationCenter.default.publisher(for: .ttrOuvrirSessionExistante)) { _ in
-            openExistingSession()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .ttrOuvrirReglages)) { _ in
-            openSettings()
         }
     }
 
@@ -325,10 +349,12 @@ struct ContentView: View {
             .background(Color(nsColor: .textBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
-        // Le journal est le seul élément conçu pour absorber la hauteur
-        // supplémentaire quand on agrandit la fenêtre : c'est celui dont on
-        // veut voir davantage de lignes, pas celui qu'on veut voir flotter.
-        .frame(minHeight: 220, maxHeight: .infinity)
+        // Hauteur définie, et non plus extensible : dans une page qui défile,
+        // une hauteur infinie n'a pas de borne où s'arrêter. Le journal garde
+        // son propre défilement interne et sa descente automatique sur la
+        // dernière ligne — c'est elle qui montre que le traitement avance,
+        // puis qu'il s'achève.
+        .frame(height: 260)
         .padding(.top, 4)
     }
 
@@ -856,3 +882,229 @@ extension Notification.Name {
     static let ttrOuvrirSessionExistante = Notification.Name("ttrOuvrirSessionExistante")
     static let ttrOuvrirReglages = Notification.Name("ttrOuvrirReglages")
 }
+
+
+/// Lecteur de vérification du fichier chargé.
+///
+/// Son objet n'est pas l'écoute de travail — celle-là se fait dans la
+/// fenêtre de vérification, où le texte accompagne le son — mais le
+/// contrôle qu'on a bien chargé ce qu'on croit, avant d'engager une heure
+/// de calcul.
+///
+/// D'où la ligne de caractéristiques à côté des commandes : c'est elle qui
+/// attrape les erreurs que l'oreille ne relève pas tout de suite. Un
+/// enregistrement tronqué se voit à sa durée, un fichier de secours en
+/// 8 kHz téléphonique se voit à sa fréquence d'échantillonnage — et ce
+/// dernier dégraderait la transcription sans qu'on comprenne pourquoi, des
+/// heures plus tard, en relisant un texte médiocre.
+struct LecteurAudio: View {
+    let url: URL
+
+    @State private var lecteur: AVPlayer?
+    @State private var observateur: Any?
+    @State private var enLecture = false
+    @State private var instant: Double = 0
+    @State private var duree: Double = 0
+    @State private var caracteristiques: String?
+    @State private var avertissement: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 10) {
+                Button {
+                    basculer()
+                } label: {
+                    Image(systemName: enLecture ? "pause.circle.fill" : "play.circle.fill")
+                        .font(.system(size: 20))
+                }
+                .buttonStyle(.plain)
+                .disabled(lecteur == nil)
+                .help(enLecture ? "Pause" : "Écouter le fichier chargé, pour vérifier que c'est le bon")
+
+                Slider(value: Binding(get: { instant }, set: { deplacer(vers: $0) }),
+                       in: 0...max(duree, 0.01))
+                    .disabled(lecteur == nil || duree <= 0)
+
+                Text("\(horodatage(instant)) / \(horodatage(duree))")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 10) {
+                if let caracteristiques {
+                    Text(caracteristiques)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let avertissement {
+                    Label(avertissement, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        // .task(id:) et non .onAppear : la vue est réutilisée quand on
+        // change de fichier sans fermer la fenêtre, et un .onAppear ne
+        // serait alors jamais rappelé — on écouterait le fichier précédent.
+        .task(id: url) { await preparer() }
+        .onDisappear { liberer() }
+    }
+
+    private func preparer() async {
+        liberer()
+        let asset = AVURLAsset(url: url)
+
+        var secondes: Double = 0
+        if let chargee = try? await asset.load(.duration) {
+            let valeur = chargee.seconds
+            secondes = (valeur.isFinite && valeur > 0) ? valeur : 0
+        }
+
+        var frequence: Double?
+        var canaux: UInt32?
+        if let pistes = try? await asset.loadTracks(withMediaType: .audio),
+           let piste = pistes.first,
+           let descriptions = try? await piste.load(.formatDescriptions),
+           let description = descriptions.first,
+           let base = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee {
+            frequence = base.mSampleRate
+            canaux = base.mChannelsPerFrame
+        }
+
+        let joueur = AVPlayer(url: url)
+        let observation = joueur.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.2, preferredTimescale: 600), queue: .main
+        ) { temps in
+            instant = temps.seconds.isFinite ? temps.seconds : 0
+        }
+
+        await MainActor.run {
+            duree = secondes
+            lecteur = joueur
+            observateur = observation
+            instant = 0
+            enLecture = false
+            caracteristiques = Self.descriptionDuFichier(
+                url: url, duree: secondes, frequence: frequence, canaux: canaux)
+            avertissement = Self.avertissement(frequence: frequence, duree: secondes)
+        }
+    }
+
+    /// Ligne « WAV · 48 kHz · stéréo · 1 h 47 », amputée de ce qu'on n'a pas
+    /// pu lire plutôt que remplie de « inconnu », qui n'apprendrait rien.
+    private static func descriptionDuFichier(url: URL, duree: Double,
+                                             frequence: Double?, canaux: UInt32?) -> String {
+        var morceaux = [url.pathExtension.uppercased()]
+        if let frequence, frequence > 0 {
+            morceaux.append(String(format: "%.1f kHz", frequence / 1000)
+                .replacingOccurrences(of: ".0 kHz", with: " kHz"))
+        }
+        if let canaux {
+            switch canaux {
+            case 1: morceaux.append("mono")
+            case 2: morceaux.append("stéréo")
+            default: morceaux.append("\(canaux) canaux")
+            }
+        }
+        if duree > 0 {
+            morceaux.append(dureeLisible(duree))
+        }
+        return morceaux.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    private static func avertissement(frequence: Double?, duree: Double) -> String? {
+        if duree <= 0 {
+            return "Durée illisible : le fichier est peut-être tronqué ou incomplet."
+        }
+        // 16 kHz est ce que réclame le pipeline ; en dessous, la bande
+        // passante manquante ne se rattrape pas et la transcription s'en
+        // ressentira sur tout le fichier.
+        if let frequence, frequence > 0, frequence < 16000 {
+            return "Échantillonné sous 16 kHz : la transcription sera nettement moins fiable."
+        }
+        return nil
+    }
+
+    private static func dureeLisible(_ secondes: Double) -> String {
+        let total = Int(secondes.rounded())
+        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
+        if h > 0 { return "\(h) h \(String(format: "%02d", m))" }
+        if m > 0 { return "\(m) min \(String(format: "%02d", s)) s" }
+        return "\(s) s"
+    }
+
+    private func horodatage(_ secondes: Double) -> String {
+        guard secondes.isFinite, secondes >= 0 else { return "00:00" }
+        let total = Int(secondes)
+        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
+        return h > 0
+            ? String(format: "%d:%02d:%02d", h, m, s)
+            : String(format: "%02d:%02d", m, s)
+    }
+
+    private func basculer() {
+        guard let lecteur else { return }
+        if enLecture {
+            lecteur.pause()
+        } else {
+            lecteur.play()
+        }
+        enLecture.toggle()
+    }
+
+    private func deplacer(vers secondes: Double) {
+        instant = secondes
+        lecteur?.seek(to: CMTime(seconds: secondes, preferredTimescale: 600),
+                      toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    /// L'observateur doit être retiré avant de lâcher le lecteur : sans
+    /// cela il continue d'écrire dans `instant`, et deux fichiers chargés
+    /// l'un après l'autre se disputent la barre de progression.
+    private func liberer() {
+        if let observateur { lecteur?.removeTimeObserver(observateur) }
+        observateur = nil
+        lecteur?.pause()
+        lecteur = nil
+        enLecture = false
+        instant = 0
+    }
+}
+
+
+/// Infobulle posée par AppKit plutôt que par SwiftUI.
+///
+/// `.help()` est le moyen normal, et il fonctionne bien dans le corps d'une
+/// fenêtre. Dans une barre d'outils, sur cette version de macOS, il n'a rien
+/// produit — ni sur une Image, ni sur un Label. On redescend donc d'un
+/// étage : une vue AppKit transparente est posée derrière le bouton, et c'est
+/// elle qui porte le `toolTip`. L'affichage devient l'affaire du système, qui
+/// sait le faire depuis toujours.
+///
+/// La vue est placée en arrière-plan et non en superposition, pour qu'elle
+/// n'intercepte jamais le clic : le bouton reste devant, elle ne fait
+/// qu'occuper la même surface.
+private struct Infobulle: NSViewRepresentable {
+    let texte: String
+
+    func makeNSView(context: Context) -> NSView {
+        let vue = NSView()
+        vue.toolTip = texte
+        return vue
+    }
+
+    func updateNSView(_ vue: NSView, context: Context) {
+        vue.toolTip = texte
+    }
+}
+
+extension View {
+    /// Associe une infobulle à cette vue, par AppKit, et conserve `.help`
+    /// pour l'accessibilité et pour le jour où SwiftUI s'en chargera.
+    func infobulle(_ texte: String) -> some View {
+        background(Infobulle(texte: texte))
+            .help(texte)
+    }
+}
+

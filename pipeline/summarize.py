@@ -500,16 +500,90 @@ def ranger(brut: str, categories: dict[str, str], notes: list[dict],
     return resultat, ecartes
 
 
+# --- Passe 3 : synthèse d'ouverture ---------------------------------------
+
+# Horodatages sous toutes les formes que le modèle peut produire malgré la
+# consigne : entre crochets, entre accents graves, ou nus au fil du texte.
+_HORODATAGE = re.compile(r"[`\[(]?\b\d{1,2}:\d{2}(?::\d{2})?\b[`\])]?")
+
+
+def prompt_synthese(resultat: dict, categories: dict[str, str], context: str | None) -> str:
+    lignes = []
+    for slug, titre in categories.items():
+        items = resultat.get(slug, [])
+        if not items:
+            continue
+        lignes.append(f"{titre} :")
+        for item in items:
+            qui = f" ({', '.join(item['locuteurs'])})" if item["locuteurs"] else ""
+            lignes.append(f"  - {item['texte']}{qui}")
+    corps = "\n".join(lignes)
+
+    return f"""{_contexte(context)}Voici le compte rendu structuré d'une réunion, rangé par catégories.
+
+---
+{corps}
+---
+
+Rédige une synthèse d'ouverture de 2 à 10 lignes, destinée à quelqu'un qui n'a pas assisté à la séance et qui veut savoir en trente secondes ce qui s'y est joué.
+
+Consignes :
+- En prose continue. Pas de liste, pas de puces, pas de titres.
+- Aucun horodatage, aucune référence à des numéros de notes ou de parties.
+- Dis ce qui s'est décidé, ce qui reste ouvert, et où se situent les désaccords s'il y en a. Nomme les personnes quand une position leur revient nettement.
+- Ne va pas au-delà de ce que contient le compte rendu ci-dessus : il a déjà été vérifié, tout ajout ne le serait pas.
+
+Réponds uniquement par le texte de la synthèse, sans préambule ni commentaire."""
+
+
+def nettoyer_synthese(brut: str) -> str:
+    """Ramène la réponse à de la prose, quoi qu'ait fait le modèle.
+
+    Trois nettoyages, chacun pour une désobéissance observée : les
+    horodatages reviennent par habitude alors qu'ils n'ont pas leur place
+    ici, les puces resurgissent parce que tout le reste du document en
+    comporte, et un préambule du genre « Voici la synthèse : » s'ajoute
+    volontiers. Mieux vaut le corriger que le redemander : une seconde passe
+    coûterait des minutes pour un résultat tout aussi incertain.
+    """
+    texte = _HORODATAGE.sub("", brut)
+    lignes = []
+    for ligne in texte.splitlines():
+        ligne = ligne.strip()
+        if not ligne:
+            continue
+        ligne = re.sub(r"^[-\u2013\u2014*\u2022]\s*", "", ligne)
+        ligne = re.sub(r"^#{1,6}\s*", "", ligne)
+        if re.fullmatch(r"(voici|voilà)\s+la\s+synthèse\s*:?", ligne, flags=re.IGNORECASE):
+            continue
+        lignes.append(ligne)
+    texte = " ".join(lignes)
+    texte = re.sub(r"\s{2,}", " ", texte)
+    return texte.strip()
+
+
 # --- Sorties ---------------------------------------------------------------
 
 def ecrire_markdown(basename: str, resultat: dict, ecartes: list[dict],
                     categories: dict[str, str], notes: list[dict],
-                    md_path: Path) -> None:
+                    md_path: Path, synthese: str | None = None) -> None:
     lignes = [f"# Résumé structuré — {basename}", ""]
+
+    # La synthèse ouvre le document, avant toute mécanique de sources : elle
+    # s'adresse à qui veut savoir en trente secondes ce qui s'est joué, et
+    # cette personne-là ne lira pas la suite.
+    if synthese:
+        lignes.append("## En bref")
+        lignes.append("")
+        lignes.append(synthese)
+        lignes.append("")
+        lignes.append("---")
+        lignes.append("")
+
     lignes.append(
-        "Chaque point porte l'horodatage des passages dont il découle : "
-        "ouvrez la session dans l'application et écoutez-les pour vérifier, "
-        "corriger ou préciser."
+        "Chaque point ci-dessous porte l'horodatage des passages dont il "
+        "découle : ouvrez la session dans l'application et écoutez-les pour "
+        "vérifier, corriger ou préciser."
     )
     lignes.append("")
 
@@ -577,6 +651,11 @@ def main() -> None:
     parser.add_argument("--categories", default=None,
                         help='Catégories sur mesure : "slug1:Titre 1;slug2:Titre 2;..."')
     parser.add_argument(
+        "--sans-synthese", action="store_true",
+        help="Ne pas rédiger la synthèse d'ouverture. Elle coûte un appel au modèle de plus, "
+        "soit quelques minutes ; c'est le seul motif de s'en passer.",
+    )
+    parser.add_argument(
         "--context", default=None,
         help="Contexte de la réunion. Si absent, cherché dans <dossier>/*_contexte.txt.",
     )
@@ -611,7 +690,7 @@ def main() -> None:
         sys.exit(f"Erreur : aucun contenu exploitable trouvé dans {input_path}")
 
     chunks = chunk_blocks(blocks, args.chunk_words)
-    print(f"[1/2] Relevé de notes sur {len(chunks)} tranche(s) avec {args.model}...",
+    print(f"[1/3] Relevé de notes sur {len(chunks)} tranche(s) avec {args.model}...",
           flush=True)
     print(f"      (comptez plusieurs minutes par tranche avec un modèle de cette "
           f"taille ; l'avancement s'affiche au fil de l'eau)", flush=True)
@@ -634,7 +713,7 @@ def main() -> None:
         sys.exit("Erreur : aucune note exploitable n'a pu être relevée. Vérifiez le "
                  "modèle choisi et la taille de contexte (--num-ctx).")
 
-    print(f"[2/2] Rangement de {len(notes)} notes dans {len(categories)} catégories...",
+    print(f"[2/3] Rangement de {len(notes)} notes dans {len(categories)} catégories...",
           flush=True)
     brut = call_ollama(prompt_rangement(notes, categories, context), args.model,
                        args.ollama_url, json_mode=True, num_ctx=args.num_ctx,
@@ -655,8 +734,24 @@ def main() -> None:
     print(f"      {retenus} item(s) retenu(s), {len(ecartes)} écarté(s) faute de source, "
           f"{avec_reserve} assorti(s) d'une réserve sur la transcription")
 
+    synthese = None
+    if not args.sans_synthese and retenus:
+        print("[3/3] Rédaction de la synthèse d'ouverture...", flush=True)
+        # La synthèse part du compte rendu retenu, et non des notes brutes :
+        # ce qui a été écarté faute de source ne doit pas revenir par la
+        # porte de derrière, sous une forme encore plus affirmative.
+        brut_synthese = call_ollama(
+            prompt_synthese(resultat, categories, context), args.model, args.ollama_url,
+            json_mode=False, num_ctx=args.num_ctx, temperature=0.3, etiquette="synthèse")
+        synthese = nettoyer_synthese(brut_synthese) or None
+        if synthese:
+            print(f"      {len(synthese.split())} mots")
+        else:
+            print("      avertissement : synthèse vide, le document s'en passera")
+
     json_path = out_dir / f"{basename}_resume.json"
     json_path.write_text(json.dumps({
+        "synthese": synthese,
         "categories": categories,
         "resultat": resultat,
         "a_verifier": ecartes,
@@ -664,7 +759,7 @@ def main() -> None:
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     md_path = out_dir / f"{basename}_resume.md"
-    ecrire_markdown(basename, resultat, ecartes, categories, notes, md_path)
+    ecrire_markdown(basename, resultat, ecartes, categories, notes, md_path, synthese)
 
     print("\nTerminé. Fichiers générés :")
     print(f"  - {md_path}   (résumé lisible)")

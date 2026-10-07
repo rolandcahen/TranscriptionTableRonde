@@ -258,7 +258,11 @@ struct ReviewView: View {
                 Button {
                     lireDepuisCurseur()
                 } label: {
-                    Label(isPlaying ? "Pause" : "Lire au curseur",
+                    // Le raccourci est écrit à côté du libellé : un
+                    // .keyboardShortcut ne s'affiche nulle part sur un bouton,
+                    // et un raccourci qu'on ne peut pas découvrir n'existe
+                    // pas.
+                    Label(isPlaying ? "Pause  ⌘⏎" : "Lire au curseur  ⌘⏎",
                           systemImage: isPlaying ? "pause.circle" : "text.cursor")
                 }
                 .keyboardShortcut(.return, modifiers: .command)
