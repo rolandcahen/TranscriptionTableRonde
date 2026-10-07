@@ -49,6 +49,7 @@ from ffmpeg_paths import ensure_ffmpeg_visible
 ensure_ffmpeg_visible()
 
 from align import assign_speakers, merge_consecutive
+from qualite_transcription import nettoyer_segments
 
 # Modèles Whisper packagés au format MLX (téléchargés depuis Hugging Face au
 # premier lancement, puis mis en cache localement).
@@ -56,6 +57,18 @@ MODEL_REPOS = {
     "large-v3": "mlx-community/whisper-large-v3-mlx",
     "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
     "medium": "mlx-community/whisper-medium-mlx",
+}
+
+# Modèles de diarisation disponibles. community-1 est le successeur de 3.1 :
+# d'après pyannote, nettement moins de confusion entre locuteurs, mais une
+# détection de parole superposée inchangée — il ne règle donc pas à lui seul
+# le problème des chevauchements. Le défaut reste 3.1 tant que la mesure sur
+# vos propres enregistrements ne l'a pas départagé : voir bench_diarization.py
+# et son option --reference, qui compare les deux contre un transcript que
+# vous avez corrigé à la main.
+DIARIZATION_REPOS = {
+    "3.1": "pyannote/speaker-diarization-3.1",
+    "communaute-1": "pyannote/speaker-diarization-community-1",
 }
 
 
@@ -94,7 +107,8 @@ def normalize_audio(audio_path: Path) -> Path:
     return tmp_path
 
 
-def transcribe(audio_path: str, model: str, language: str, context: str | None):
+def transcribe(audio_path: str, model: str, language: str, context: str | None,
+               word_timestamps: bool = False, decodage: dict | None = None):
     import mlx_whisper  # import local : n'est nécessaire que sur Mac Apple Silicon
 
     repo = MODEL_REPOS.get(model, model)  # accepte aussi un repo HF passé directement
@@ -104,18 +118,25 @@ def transcribe(audio_path: str, model: str, language: str, context: str | None):
         audio_path,
         path_or_hf_repo=repo,
         language=language,
-        word_timestamps=False,
+        # L'horodatage mot à mot est ce qui permet d'attribuer la parole mot
+        # par mot plutôt que segment par segment, et donc de couper au bon
+        # endroit quand un segment enjambe un changement de locuteur. Il
+        # ajoute une passe d'alignement à la transcription : c'est un choix,
+        # d'où l'option.
+        word_timestamps=word_timestamps,
         verbose=False,
         # Amorce le décodage avec le contexte fourni (sujet, participants,
         # noms propres/termes techniques) : améliore nettement la
         # reconnaissance de ces mots plutôt que de les laisser au hasard.
         initial_prompt=context or None,
+        **(decodage or {}),
     )
     print(f"      terminé en {time.time() - t0:.0f}s ({len(result['segments'])} segments)")
     return result["segments"]
 
 
-def _transcription_signature(audio_path: Path, model: str, language: str, context: str | None) -> dict:
+def _transcription_signature(audio_path: Path, model: str, language: str, context: str | None,
+                             word_timestamps: bool = False, decodage: dict | None = None) -> dict:
     """Empreinte de ce qui influence le résultat de la transcription.
 
     Sert à ne réutiliser un cache que s'il correspond exactement au même
@@ -123,8 +144,12 @@ def _transcription_signature(audio_path: Path, model: str, language: str, contex
     contexte doit refaire la transcription, pas recycler l'ancienne.
     """
     stat = audio_path.stat()
-    return {
-        "version": 1,
+    signature = {
+        # version 2 : le changement de défaut de condition_on_previous_text
+        # modifie le texte produit. Les transcriptions déjà en cache ont été
+        # faites avec l'ancien comportement et ne doivent pas être relues
+        # comme si elles venaient du nouveau.
+        "version": 2,
         "audio_name": audio_path.name,
         "audio_size": stat.st_size,
         "audio_mtime": int(stat.st_mtime),
@@ -132,6 +157,20 @@ def _transcription_signature(audio_path: Path, model: str, language: str, contex
         "language": language,
         "context_sha1": hashlib.sha1((context or "").encode("utf-8")).hexdigest(),
     }
+    # La clé n'est ajoutée que lorsque l'horodatage mot à mot est demandé.
+    # Deux raisons : un cache produit sans les mots ne doit jamais être
+    # réutilisé pour une demande avec les mots — l'option serait sans effet
+    # et rien ne le signalerait ; et, dans l'autre sens, toutes les
+    # transcriptions déjà en cache restent valides au lieu d'être invalidées
+    # en bloc par l'arrivée de cette option.
+    if word_timestamps:
+        signature["word_timestamps"] = True
+    # Même raisonnement pour les réglages du décodeur : ils changent le texte
+    # produit, donc ils doivent invalider le cache — mais seulement quand on
+    # s'écarte des valeurs d'origine, pour ne pas périmer l'existant.
+    if decodage:
+        signature["decodage"] = {k: decodage[k] for k in sorted(decodage)}
+    return signature
 
 
 def load_cached_transcription(cache_path: Path, signature: dict):
@@ -251,16 +290,64 @@ def _apply_pipeline(pipeline, audio_path: str, hook, kwargs: dict):
         return pipeline(audio_path, **kwargs)
 
 
-def diarize(audio_path: str, hf_token: str, num_speakers: int | None, device_preference: str = "auto"):
+def _appliquer_reglages_vitesse(pipeline, batch_size: int | None, segmentation_step: float | None) -> str:
+    """Pose les réglages de débit de la diarisation et décrit ce qui a pris.
+
+    Deux leviers, de natures très différentes :
+
+    `batch_size` groupe les fenêtres traitées ensemble. Le calcul effectué
+    reste le même quel que soit le groupement : seules la vitesse et la
+    mémoire changent. Attention toutefois à une fausse évidence — la classe
+    SpeakerDiarization de pyannote a bien un défaut de 1, mais le dépôt
+    speaker-diarization-3.1 le remplace par 32 dans son propre fichier de
+    configuration. Rien à gagner de ce côté, donc : mesuré sur cette
+    machine, 38,9 s contre 38,7 s sur dix minutes d'audio, les deux
+    configurations tournant en réalité déjà à 32. D'où la valeur par défaut
+    laissée à None, qui respecte ce que les auteurs du modèle ont réglé.
+
+    `segmentation_step` est l'inverse : il espace la fenêtre glissante, donc
+    il calcule réellement moins. Il va plus vite en analysant moins
+    finement, et les mesures faites sur ces enregistrements ont montré 6 à
+    12 % de divergence pour environ une heure gagnée sur trente heures
+    d'audio. D'où son absence de valeur par défaut : à n'activer qu'en
+    connaissance de cause, pour un dégrossissage.
+    """
+    details = []
+    if batch_size:
+        try:
+            pipeline.segmentation_batch_size = batch_size
+            pipeline.embedding_batch_size = batch_size
+            details.append(f"lots de {batch_size}")
+        except Exception as exc:
+            details.append(f"lots non réglables sur ce modèle ({type(exc).__name__})")
+    if segmentation_step:
+        try:
+            inference = pipeline._segmentation
+            inference.step = segmentation_step * inference.duration
+            details.append(f"pas de fenêtre {segmentation_step:.2f}× (qualité réduite)")
+        except AttributeError:
+            details.append("pas de fenêtre non réglable sur cette version")
+    return ", ".join(details) if details else "réglages du dépôt tels quels"
+
+
+def diarize(audio_path: str, hf_token: str, num_speakers: int | None,
+            device_preference: str = "auto", diarization_model: str = "3.1",
+            batch_size: int | None = 32, segmentation_step: float | None = None):
     import torch
     from pyannote.audio import Pipeline
 
-    print("[2/3] Diarisation (détection des locuteurs) avec pyannote...")
+    repo = DIARIZATION_REPOS.get(diarization_model, diarization_model)
+    print(f"[2/3] Diarisation (détection des locuteurs) avec {repo}...")
     t0 = time.time()
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        token=hf_token,
-    )
+    try:
+        pipeline = Pipeline.from_pretrained(repo, token=hf_token)
+    except Exception as exc:
+        sys.exit(
+            f"Erreur : impossible de charger le modèle de diarisation {repo}.\n"
+            f"{type(exc).__name__}: {exc}\n"
+            f"Si l'accès est refusé, acceptez les conditions d'utilisation sur "
+            f"https://huggingface.co/{repo} avec le compte qui a produit votre token."
+        )
 
     kwargs = {}
     if num_speakers:
@@ -268,7 +355,8 @@ def diarize(audio_path: str, hf_token: str, num_speakers: int | None, device_pre
     hook = DiarizationProgress()
 
     device = _select_device(device_preference)
-    print(f"      calcul sur {'GPU (MPS)' if device.type == 'mps' else 'CPU'}")
+    reglages = _appliquer_reglages_vitesse(pipeline, batch_size, segmentation_step)
+    print(f"      calcul sur {'GPU (MPS)' if device.type == 'mps' else 'CPU'} — {reglages}")
     try:
         pipeline.to(device)
         diarization = _apply_pipeline(pipeline, audio_path, hook, kwargs)
@@ -280,6 +368,7 @@ def diarize(audio_path: str, hf_token: str, num_speakers: int | None, device_pre
         print(f"      Échec de la diarisation sur le GPU : {exc}")
         print("      Reprise depuis le début sur le CPU (plus lent, mais fiable)...")
         pipeline.to(torch.device("cpu"))
+        _appliquer_reglages_vitesse(pipeline, batch_size, segmentation_step)
         diarization = _apply_pipeline(pipeline, audio_path, hook, kwargs)
 
     # pyannote 4.x renvoie un objet structuré (.speaker_diarization),
@@ -373,6 +462,69 @@ def main():
         help="Token Hugging Face (ou variable d'environnement HF_TOKEN)",
     )
     parser.add_argument(
+        "--diarization-model",
+        default="3.1",
+        choices=list(DIARIZATION_REPOS.keys()),
+        help="Modèle de diarisation (défaut : 3.1). « communaute-1 » est plus récent et "
+        "annoncé meilleur sur la confusion entre locuteurs ; mesurez-le sur vos propres "
+        "fichiers avec bench_diarization.py --reference avant d'en faire la norme.",
+    )
+    parser.add_argument(
+        "--condition-on-previous-text",
+        action="store_true",
+        help="Réinjecter le texte déjà transcrit comme contexte de la fenêtre suivante. "
+        "C'est le comportement d'origine de Whisper, désactivé ici par défaut : mesuré sur un "
+        "extrait de dix minutes, il produisait 258 mots inventés en boucle (dont 216 sur un "
+        "seul segment) contre aucun sans lui, et faisait passer la part de temps douteux de "
+        "7,9 %% à 16,8 %%. À réactiver si la cohérence des noms propres d'une fenêtre à "
+        "l'autre compte plus que la robustesse.",
+    )
+    parser.add_argument(
+        "--no-speech-threshold",
+        type=float,
+        default=None,
+        help="Au-dessus de cette probabilité d'absence de parole, un passage est considéré "
+        "comme silencieux (défaut de Whisper : 0.6). Abaisser à 0.4-0.5 réduit les textes "
+        "inventés sur du bruit, au risque de perdre de la parole difficile.",
+    )
+    parser.add_argument(
+        "--logprob-threshold",
+        type=float,
+        default=None,
+        help="En dessous de cette confiance moyenne, Whisper rejuge le passage (défaut : -1.0).",
+    )
+    parser.add_argument(
+        "--compression-ratio-threshold",
+        type=float,
+        default=None,
+        help="Au-dessus de ce taux de compression, le texte est jugé dégénéré et retenté "
+        "(défaut : 2.4). Abaisser à 2.2 attrape davantage de boucles de répétition.",
+    )
+    parser.add_argument(
+        "--word-timestamps",
+        action="store_true",
+        help="Horodater chaque mot pendant la transcription, pour attribuer la parole mot à "
+        "mot plutôt que segment par segment. Corrige les segments à cheval sur un changement "
+        "de locuteur, au prix d'une passe d'alignement supplémentaire à l'étape 1.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="Nombre de fenêtres traitées ensemble pendant la diarisation. Par défaut (0), "
+        "on garde le réglage du dépôt du modèle, qui vaut déjà 32 pour "
+        "speaker-diarization-3.1 — mesuré sans effet sur la vitesse. À ne changer que pour "
+        "expérimenter, ou si la mémoire vient à manquer (valeur plus basse).",
+    )
+    parser.add_argument(
+        "--segmentation-step",
+        type=float,
+        default=None,
+        help="Espacement de la fenêtre glissante, en fraction de sa durée (ex. 0.25). "
+        "Accélère en analysant moins finement : mesuré à 6-12 %% de divergence sur ces "
+        "enregistrements. Non activé par défaut, et déconseillé hors dégrossissage.",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         choices=["auto", "mps", "cpu"],
@@ -410,8 +562,27 @@ def main():
     if args.context:
         (out_dir / f"{basename}_contexte.txt").write_text(args.context, encoding="utf-8")
 
+    # Seuls les réglages explicitement demandés sont transmis : laisser les
+    # autres à leur valeur d'origine est le meilleur moyen de ne pas changer
+    # silencieusement le comportement de ce qui marche déjà.
+    decodage: dict = {
+        # Désactivé par défaut, contre le défaut de Whisper : voir l'aide de
+        # --condition-on-previous-text pour la mesure qui a tranché. Une
+        # boucle de répétition ne fait pas que produire du texte faux, elle
+        # remplace la parole réelle de tout un segment — 216 mots perdus
+        # d'un coup sur l'extrait de référence.
+        "condition_on_previous_text": bool(args.condition_on_previous_text),
+    }
+    if args.no_speech_threshold is not None:
+        decodage["no_speech_threshold"] = args.no_speech_threshold
+    if args.logprob_threshold is not None:
+        decodage["logprob_threshold"] = args.logprob_threshold
+    if args.compression_ratio_threshold is not None:
+        decodage["compression_ratio_threshold"] = args.compression_ratio_threshold
+
     cache_path = out_dir / f"{basename}_whisper_raw.json"
-    signature = _transcription_signature(audio_path, args.model, args.language, args.context)
+    signature = _transcription_signature(audio_path, args.model, args.language, args.context,
+                                         args.word_timestamps, decodage)
 
     print("Normalisation de l'audio (conversion en WAV 16 kHz mono)...")
     normalized_path = normalize_audio(audio_path)
@@ -420,20 +591,44 @@ def main():
         if not args.force_transcription:
             whisper_segments = load_cached_transcription(cache_path, signature)
         if whisper_segments is None:
-            whisper_segments = transcribe(str(normalized_path), args.model, args.language, args.context)
+            whisper_segments = transcribe(str(normalized_path), args.model, args.language,
+                                          args.context, args.word_timestamps, decodage)
             # Écrit sur disque immédiatement : si la diarisation échoue ou
             # est interrompue, cette transcription-là est acquise et la
             # prochaine exécution repartira directement de l'étape 2.
             save_transcription_cache(cache_path, signature, whisper_segments)
         diarization_turns = diarize(
-            str(normalized_path), args.hf_token, args.num_speakers, args.device
+            str(normalized_path), args.hf_token, args.num_speakers, args.device,
+            args.diarization_model, args.batch_size or None, args.segmentation_step,
         )
     finally:
         normalized_path.unlink(missing_ok=True)
 
     print("[3/3] Fusion transcription + locuteurs...")
-    labeled = assign_speakers(whisper_segments, diarization_turns)
+    labeled = assign_speakers(whisper_segments, diarization_turns, par_mot=args.word_timestamps)
+    if args.word_timestamps:
+        decoupes = len(labeled) - len(whisper_segments)
+        print(f"      attribution mot à mot : {decoupes} segment(s) scindé(s) "
+              f"sur un changement de locuteur")
+    # Les horodatages de mots ont joué leur rôle au moment de l'attribution.
+    # Les conserver quintuplerait la taille du transcript sans que rien ne
+    # les relise — et la fusion de deux segments ne saurait de toute façon
+    # pas recoller deux listes de mots sans se contredire.
+    for seg in labeled:
+        seg.pop("words", None)
     merged = merge_consecutive(labeled, max_gap=args.max_gap)
+
+    # Le nettoyage vient APRÈS la fusion, et ce n'est pas indifférent : il a
+    # besoin de `speech_share`, que seule l'attribution calcule, et le faire
+    # sur les segments définitifs évite d'avoir à recombiner des signalements
+    # au moment de les fusionner. Il s'applique donc aussi aux transcriptions
+    # relues depuis le cache, puisqu'il ne porte que sur le texte et non sur
+    # le calcul : inutile de retranscrire pour en bénéficier.
+    bilan = nettoyer_segments(merged)
+    if bilan["segments_replies"] or bilan["segments_suspects"]:
+        print(f"      nettoyage : {bilan['segments_replies']} boucle(s) de répétition "
+              f"repliée(s) ({bilan['mots_retires']} mots retirés), "
+              f"{bilan['segments_suspects']} segment(s) signalé(s) comme douteux")
 
     txt_path, json_path, speakers_map_path = write_outputs(basename, out_dir, merged)
 

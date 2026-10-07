@@ -22,6 +22,27 @@ private struct EditableSegment: Identifiable {
     var avgLogprob: Double
     var noSpeechProb: Double
     var raw: [String: Any]
+
+    // Indicateurs calculés par le pipeline (align.py et
+    // qualite_transcription.py). Optionnels : un transcript produit avant
+    // leur existence n'en porte aucun, et l'absence d'indicateur ne doit
+    // surtout pas se lire comme un indicateur au plus mauvais.
+    var speakerShare: Double? = nil
+    var speakerAlt: String? = nil
+    var overlapShare: Double? = nil
+    var speechShare: Double? = nil
+    var suspectReason: String? = nil
+
+    /// Valeurs au chargement, pour savoir si la relecture a invalidé les
+    /// indicateurs : une fois le locuteur ou le texte corrigé à la main,
+    /// ils ne décrivent plus ce segment et doivent disparaître du fichier
+    /// plutôt que d'y rester à mentir.
+    var chargeSpeakerID: String = ""
+    var chargeText: String = ""
+
+    var indicateursPerimes: Bool {
+        speakerID != chargeSpeakerID || text != chargeText
+    }
 }
 
 private struct SpeakerSummary: Identifiable {
@@ -412,6 +433,29 @@ struct ReviewView: View {
                     .foregroundStyle(confianceTeinte(s))
                     .help("Confiance moyenne du modèle sur ce segment. Ce n'est pas un taux d'exactitude : elle sert à repérer les passages à relire en priorité.")
 
+                // Le doute d'attribution est actionnable, pas seulement
+                // informatif : l'autre candidat est connu, autant proposer
+                // de basculer dessus d'un clic plutôt que de faire rouvrir
+                // le menu déroulant.
+                if let doute = douteAttribution(s) {
+                    Button {
+                        memoriserPourAnnulation()
+                        segment.speakerID.wrappedValue = doute.autre
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: voixSuperposees(s) ? "waveform.badge.exclamationmark" : "person.2.fill")
+                            Text("\(Int((doute.part * 100).rounded()))% · ou \(displayName(for: doute.autre)) ?")
+                                .font(.caption2)
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(.orange)
+                    }
+                    .buttonStyle(.plain)
+                    .help(voixSuperposees(s)
+                          ? "Deux personnes parlent en même temps ici : le texte lui-même est peu fiable. Cliquer attribue le segment à \(displayName(for: doute.autre))."
+                          : "La parole de ce segment est partagée entre deux locuteurs qui se succèdent : la coupure est probablement au mauvais endroit. Cliquer l'attribue à \(displayName(for: doute.autre)).")
+                }
+
                 if isFlagged(s) {
                     HStack(spacing: 3) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -585,6 +629,9 @@ struct ReviewView: View {
                     text: part,
                     speakerID: original.speakerID,
                     avgLogprob: original.avgLogprob,
+                    // chargeSpeakerID/chargeText laissés vides : un morceau
+                    // issu d'une division est par construction du contenu
+                    // nouveau, ses indicateurs hérités sont donc périmés.
                     noSpeechProb: original.noSpeechProb,
                     raw: original.raw
                 )
@@ -667,7 +714,13 @@ struct ReviewView: View {
         return false
     }
 
+    /// Un segment est signalé soit par le pipeline, qui dispose d'éléments
+    /// que l'app n'a pas — notamment le croisement avec la diarisation —
+    /// soit, pour les transcripts plus anciens, par les heuristiques
+    /// calculées ici.
     private func isFlagged(_ segment: EditableSegment) -> Bool {
+        if segment.indicateursPerimes { return false }
+        if segment.suspectReason != nil { return true }
         let duration = segment.end - segment.start
         return segment.avgLogprob <= -0.8
             || segment.noSpeechProb > 0.6
@@ -676,7 +729,23 @@ struct ReviewView: View {
             || (duration < 0.3 && !segment.text.isEmpty)
     }
 
+    /// Part de la parole du segment revenant au locuteur retenu, quand elle
+    /// est franchement partagée avec un autre. Le seuil de 0,80 vient de la
+    /// mesure faite sur un extrait réel : au-dessus, les segments concernés
+    /// se comptent sur les doigts d'une main et se lisent très bien.
+    private func douteAttribution(_ segment: EditableSegment) -> (part: Double, autre: String)? {
+        guard !segment.indicateursPerimes,
+              let part = segment.speakerShare, part < 0.80,
+              let autre = segment.speakerAlt, !autre.isEmpty else { return nil }
+        return (part, autre)
+    }
+
+    private func voixSuperposees(_ segment: EditableSegment) -> Bool {
+        !segment.indicateursPerimes && (segment.overlapShare ?? 0) > 0.05
+    }
+
     private func flagReason(_ segment: EditableSegment) -> String {
+        if let raison = segment.suspectReason, !raison.isEmpty { return raison }
         var reasons: [String] = []
         let duration = segment.end - segment.start
         if segment.avgLogprob <= -0.8 { reasons.append("confiance faible") }
@@ -895,14 +964,23 @@ struct ReviewView: View {
             raw.removeValue(forKey: "end")
             raw.removeValue(forKey: "text")
             raw.removeValue(forKey: "speaker")
+            let texte = dict["text"] as? String ?? ""
+            let locuteur = dict["speaker"] as? String ?? "INCONNU"
             return EditableSegment(
                 start: dict["start"] as? Double ?? 0,
                 end: dict["end"] as? Double ?? 0,
-                text: dict["text"] as? String ?? "",
-                speakerID: dict["speaker"] as? String ?? "INCONNU",
+                text: texte,
+                speakerID: locuteur,
                 avgLogprob: dict["avg_logprob"] as? Double ?? 0,
                 noSpeechProb: dict["no_speech_prob"] as? Double ?? 0,
-                raw: raw
+                raw: raw,
+                speakerShare: dict["speaker_share"] as? Double,
+                speakerAlt: dict["speaker_alt"] as? String,
+                overlapShare: dict["overlap_share"] as? Double,
+                speechShare: dict["speech_share"] as? Double,
+                suspectReason: dict["suspect_reason"] as? String,
+                chargeSpeakerID: locuteur,
+                chargeText: texte
             )
         }
     }
@@ -947,6 +1025,18 @@ struct ReviewView: View {
             dict["end"] = segment.end
             dict["text"] = segment.text
             dict["speaker"] = displayName(for: segment.speakerID)
+            // Un segment que vous avez corrigé n'est plus décrit par les
+            // indicateurs calculés avant votre correction. Les laisser ferait
+            // réapparaître le signalement orange sur un segment désormais
+            // juste — et, pire, le ferait ressortir dans le diagnostic comme
+            // un problème non résolu.
+            if segment.indicateursPerimes {
+                for cle in ["speaker_share", "speaker_alt", "speaker_alt_share",
+                            "overlap_share", "speech_share",
+                            "suspect", "suspect_reason", "suspect_causes"] {
+                    dict.removeValue(forKey: cle)
+                }
+            }
             updated.append(dict)
         }
 

@@ -9,16 +9,31 @@ supposer quel réglage aide, ce script les essaie l'un après l'autre sur le
 même extrait et affiche un tableau : temps, nombre de locuteurs trouvés,
 et écart avec la configuration de référence.
 
-L'écart est mesuré avec la DER (Diarization Error Rate) de
-pyannote.metrics, en prenant la PREMIÈRE configuration comme référence.
-Ce n'est donc pas une mesure de justesse absolue — il faudrait une
-annotation manuelle pour cela — mais une mesure de divergence : « ce
-réglage plus rapide donne-t-il toujours le même découpage ? ». 0 % = un
-résultat identique à la référence.
+Deux manières de mesurer, selon qu'on dispose ou non d'une référence :
+
+  Sans --reference, l'écart est une DIVERGENCE : la première configuration
+  sert d'étalon, les autres lui sont comparées. 0 % = découpage identique.
+  C'est suffisant pour répondre à « ce réglage plus rapide change-t-il
+  quelque chose ? », mais incapable de répondre à « lequel des deux a
+  raison ? » : deux résultats peuvent diverger parce que l'un s'améliore
+  tout autant que parce qu'il se dégrade.
+
+  Avec --reference, l'écart devient une vraie DER (Diarization Error Rate),
+  mesurée contre un transcript corrigé à la main dans la fenêtre de
+  vérification. C'est la seule façon honnête de départager deux MODÈLES.
+  Elle est décomposée en ses trois termes, qui ne se corrigent pas de la
+  même manière :
+      confusion  la parole est détectée mais attribuée au mauvais
+                 locuteur — c'est ce que les chevauchements dégradent ;
+      manquée    de la parole n'a pas été détectée du tout ;
+      fausse     du silence ou du bruit pris pour de la parole.
 
 Usage :
     python bench_diarization.py --audio reunion.mp3 --minutes 10 --hf-token hf_xxx
     python bench_diarization.py --audio reunion.mp3 --configs cpu-defaut,mps-lot32
+    python bench_diarization.py --audio reunion.wav --minutes 10 \\
+        --configs mps-lot32,communaute1 \\
+        --reference sortie_reunion/reunion_transcript.json
     python bench_diarization.py --audio extrait.wav --num-speakers 5 --list-configs
 
 Le token peut aussi venir de la variable d'environnement HF_TOKEN. Il
@@ -28,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import os
 import subprocess
 import sys
@@ -45,8 +61,18 @@ from ffmpeg_paths import ensure_ffmpeg_visible
 ensure_ffmpeg_visible()
 
 
-# Chaque configuration : (périphérique, taille de lot, pas de la fenêtre
-# glissante en ratio de sa durée). `None` = on garde ce que le dépôt
+# Modèles de diarisation comparables. community-1 est le successeur annoncé
+# de 3.1 : même détection de parole superposée d'après pyannote, mais
+# nettement moins de confusion entre locuteurs. « Annoncé » : d'où ce banc
+# d'essai, pour le vérifier sur VOS enregistrements plutôt que sur AMI.
+MODELES = {
+    "3.1": "pyannote/speaker-diarization-3.1",
+    "communaute-1": "pyannote/speaker-diarization-community-1",
+}
+MODELE_PAR_DEFAUT = "3.1"
+
+# Chaque configuration : (modèle, périphérique, taille de lot, pas de la
+# fenêtre glissante en ratio de sa durée). `None` = on garde ce que le dépôt
 # Hugging Face a configuré, sans y toucher.
 CONFIGS = {
     "cpu-defaut": {
@@ -63,7 +89,7 @@ CONFIGS = {
     },
     "mps-lot32": {
         "device": "mps", "batch": 32, "step": None,
-        "description": "GPU Apple + lots de 32",
+        "description": "GPU Apple + lots de 32 (le réglage en production)",
     },
     "mps-lot64": {
         "device": "mps", "batch": 64, "step": None,
@@ -76,6 +102,16 @@ CONFIGS = {
     "mps-lot32-pas0.5": {
         "device": "mps", "batch": 32, "step": 0.5,
         "description": "GPU + lots de 32 + fenêtre glissante 5× moins dense",
+    },
+    "communaute1": {
+        "modele": "communaute-1",
+        "device": "mps", "batch": 32, "step": None,
+        "description": "modèle community-1, GPU + lots de 32 (à comparer à mps-lot32)",
+    },
+    "communaute1-cpu": {
+        "modele": "communaute-1",
+        "device": "cpu", "batch": 32, "step": None,
+        "description": "modèle community-1 sur CPU, si le GPU pose problème",
     },
 }
 
@@ -112,15 +148,65 @@ def audio_seconds(path: Path) -> float:
         return 0.0
 
 
-def load_pipeline(hf_token: str):
+def load_pipeline(hf_token: str, modele: str):
     from pyannote.audio import Pipeline
 
-    return Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=hf_token)
+    repo = MODELES.get(modele, modele)
+    return Pipeline.from_pretrained(repo, token=hf_token)
 
 
 def annotation_of(result):
     """pyannote 4.x renvoie un objet structuré, 3.x une Annotation."""
     return getattr(result, "speaker_diarization", result)
+
+
+def lire_reference(chemin: Path):
+    """Construit une annotation de référence à partir d'un transcript corrigé.
+
+    Le format attendu est celui que produit la fenêtre de vérification :
+    une liste de segments {start, end, speaker, text}. C'est volontairement
+    le fichier que vous corrigez déjà, pour qu'établir une vérité de terrain
+    ne demande aucun outil ni aucun format supplémentaire — relire dix
+    minutes d'extrait dans l'app suffit.
+
+    Limite à garder en tête : les frontières de ces segments viennent du
+    découpage de Whisper, pas des vraies frontières acoustiques de parole.
+    La DER obtenue est donc une DER « de terrain », pas une DER de
+    laboratoire. Elle reste parfaitement valable pour comparer deux modèles
+    entre eux sur le même extrait, ce qui est tout ce qu'on lui demande.
+    """
+    from pyannote.core import Annotation, Segment
+
+    try:
+        donnees = json.loads(chemin.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.exit(f"Erreur : référence illisible ({chemin}) : {exc}")
+    if isinstance(donnees, dict):
+        donnees = donnees.get("segments") or donnees.get("transcript") or []
+    if not isinstance(donnees, list) or not donnees:
+        sys.exit(f"Erreur : aucun segment exploitable dans {chemin}")
+
+    annotation = Annotation(uri="reference")
+    retenus = 0
+    for i, seg in enumerate(donnees):
+        try:
+            debut, fin = float(seg["start"]), float(seg["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        locuteur = str(seg.get("speaker") or "").strip()
+        # Un segment laissé « INCONNU » n'est pas une vérité : l'inclure
+        # reviendrait à compter comme erreur ce que vous n'avez pas tranché.
+        if fin <= debut or not locuteur or locuteur.upper() == "INCONNU":
+            continue
+        annotation[Segment(debut, fin), i] = locuteur
+        retenus += 1
+
+    if not retenus:
+        sys.exit(f"Erreur : aucun segment avec un locuteur nommé dans {chemin}")
+    duree = sum(s.duration for s in annotation.get_timeline().support())
+    print(f"Référence : {retenus} segments, {len(annotation.labels())} locuteurs, "
+          f"{duree / 60:.1f} min de parole annotée ({chemin.name})")
+    return annotation
 
 
 def apply_config(pipeline, config: dict) -> dict:
@@ -138,8 +224,11 @@ def apply_config(pipeline, config: dict) -> dict:
     if config["batch"] is not None:
         pipeline.segmentation_batch_size = config["batch"]
         pipeline.embedding_batch_size = config["batch"]
-    applied["segmentation_batch"] = pipeline.segmentation_batch_size
-    applied["embedding_batch"] = pipeline.embedding_batch_size
+    # getattr plutôt qu'un accès direct : un modèle plus récent peut ne pas
+    # exposer ces attributs, et l'absence d'un indicateur d'affichage ne
+    # doit pas faire échouer la mesure elle-même.
+    applied["segmentation_batch"] = getattr(pipeline, "segmentation_batch_size", "?")
+    applied["embedding_batch"] = getattr(pipeline, "embedding_batch_size", "?")
 
     if config["step"] is not None:
         try:
@@ -158,13 +247,23 @@ def apply_config(pipeline, config: dict) -> dict:
 
 def run_one(name: str, config: dict, wav: Path, hf_token: str, num_speakers: int | None):
     print(f"\n── {name} : {config['description']}")
-    pipeline = load_pipeline(hf_token)
+    modele = config.get("modele", MODELE_PAR_DEFAUT)
+    try:
+        pipeline = load_pipeline(hf_token, modele)
+    except Exception as exc:
+        # Cas le plus fréquent : les conditions d'utilisation du modèle
+        # n'ont pas encore été acceptées sur Hugging Face. On le dit
+        # plutôt que de laisser une trace d'exception brute.
+        print(f"   ÉCHEC au chargement de {MODELES.get(modele, modele)} : {type(exc).__name__}: {exc}")
+        print(f"   (si c'est un refus d'accès : acceptez les conditions sur "
+              f"https://huggingface.co/{MODELES.get(modele, modele)})")
+        return {"name": name, "error": f"chargement du modèle : {exc}", "modele": modele}
     applied = apply_config(pipeline, config)
     if "skipped" in applied:
         print(f"   ignoré ({applied['skipped']})")
         return None
 
-    print(f"   périphérique={applied['device']}  "
+    print(f"   modèle={modele}  périphérique={applied['device']}  "
           f"lots seg/emb={applied['segmentation_batch']}/{applied['embedding_batch']}  "
           f"fenêtre={applied['window']}")
 
@@ -187,19 +286,54 @@ def run_one(name: str, config: dict, wav: Path, hf_token: str, num_speakers: int
     return {
         "name": name, "seconds": elapsed, "annotation": annotation,
         "speakers": speakers, "speech": speech, "applied": applied,
+        "modele": modele,
     }
 
 
-def divergence(reference, hypothesis) -> float | None:
-    """DER entre deux résultats : 0 = découpages identiques."""
+def divergence(reference, hypothesis, uem=None) -> float | None:
+    """DER entre deux résultats : 0 = découpages identiques.
+
+    La fenêtre d'évaluation est passée explicitement : sans elle,
+    pyannote.metrics l'approxime par l'union des deux annotations et
+    l'annonce par un avertissement, qui venait s'imprimer au milieu du
+    tableau de résultats.
+    """
     try:
         from pyannote.metrics.diarization import DiarizationErrorRate
     except ImportError:
         return None
     try:
-        return float(DiarizationErrorRate()(reference, hypothesis))
+        return float(DiarizationErrorRate()(reference, hypothesis, uem=uem))
     except Exception:
         return None
+
+
+def evaluer(reference, hypothesis, uem=None) -> dict | None:
+    """DER détaillée contre une vérité de terrain.
+
+    Renvoie la DER globale et ses trois composantes, ramenées à la durée de
+    parole de la référence. Séparer ces termes compte : une confusion élevée
+    se soigne en changeant de modèle ou en désambiguïsant les chevauchements,
+    une détection manquée en reprenant la prise de son ou le seuil de
+    détection de parole. Un chiffre unique mélangerait deux diagnostics.
+    """
+    try:
+        from pyannote.metrics.diarization import DiarizationErrorRate
+    except ImportError:
+        return None
+    try:
+        detail = DiarizationErrorRate()(reference, hypothesis, uem=uem, detailed=True)
+    except Exception:
+        return None
+    total = detail.get("total") or 0.0
+    if not total:
+        return None
+    return {
+        "der": detail.get("diarization error rate", 0.0),
+        "confusion": detail.get("confusion", 0.0) / total,
+        "manquee": detail.get("missed detection", 0.0) / total,
+        "fausse": detail.get("false alarm", 0.0) / total,
+    }
 
 
 def main():
@@ -213,6 +347,13 @@ def main():
     parser.add_argument("--configs", default=",".join(DEFAULT_CONFIGS),
                         help="Configurations à comparer, séparées par des virgules")
     parser.add_argument("--list-configs", action="store_true", help="Afficher les configurations disponibles")
+    parser.add_argument(
+        "--reference",
+        default=None,
+        help="Transcript corrige a la main (*_transcript.json) servant de verite de terrain. "
+        "L'ecart affiche devient alors une vraie DER, decomposee en confusion / manquee / fausse, "
+        "au lieu d'une simple divergence entre configurations.",
+    )
     args = parser.parse_args()
 
     if args.list_configs:
@@ -234,6 +375,13 @@ def main():
     if inconnues:
         sys.exit(f"Configuration(s) inconnue(s) : {', '.join(inconnues)}\n"
                  f"Disponibles : {', '.join(CONFIGS)}")
+
+    reference_verite = None
+    if args.reference:
+        chemin_ref = Path(args.reference)
+        if not chemin_ref.exists():
+            sys.exit(f"Erreur : référence introuvable : {chemin_ref}")
+        reference_verite = lire_reference(chemin_ref)
 
     print(f"Extraction de l'échantillon depuis {audio_path.name}…")
     wav = extract(audio_path, args.minutes)
@@ -257,29 +405,78 @@ def main():
         return
 
     reference = valides[0]
-    print("\n" + "=" * 78)
-    print(f"RÉSULTATS — {duree / 60:.1f} min d'audio, référence = {reference['name']}")
-    print("=" * 78)
-    print(f"{'configuration':24s} {'temps':>8s} {'×temps réel':>12s} {'gain':>7s} {'loc.':>5s} {'écart':>8s}")
-    print("-" * 78)
+    largeur = 92 if reference_verite is not None else 78
+    print("\n" + "=" * largeur)
+    if reference_verite is not None:
+        print(f"RÉSULTATS — {duree / 60:.1f} min d'audio, mesurés contre votre transcript corrigé")
+    else:
+        print(f"RÉSULTATS — {duree / 60:.1f} min d'audio, référence = {reference['name']}")
+    print("=" * largeur)
+
+    # Toutes les mesures sont bornées à l'extrait réellement traité. Sans
+    # cette fenêtre, ce que la référence contient au-delà serait compté
+    # comme de la parole non détectée — et en mode divergence,
+    # pyannote.metrics imprimait un avertissement en plein tableau.
+    uem = None
+    if duree > 0:
+        from pyannote.core import Segment, Timeline
+
+        uem = Timeline([Segment(0.0, duree)])
+
+    if reference_verite is not None:
+        print(f"{'configuration':20s} {'modèle':13s} {'temps':>7s} {'loc.':>5s} "
+              f"{'DER':>7s} {'confus.':>8s} {'manquée':>8s} {'fausse':>7s}")
+    else:
+        print(f"{'configuration':24s} {'temps':>8s} {'×temps réel':>12s} {'gain':>7s} "
+              f"{'loc.':>5s} {'écart':>8s}")
+    print("-" * largeur)
+
     for r in valides:
         ratio = duree / r["seconds"] if r["seconds"] else 0
         gain = reference["seconds"] / r["seconds"] if r["seconds"] else 0
-        if r is reference:
-            ecart = "réf."
+        if reference_verite is not None:
+            m = evaluer(reference_verite, r["annotation"], uem=uem)
+            if m is None:
+                print(f"{r['name']:20s} {r.get('modele', ''):13s} {r['seconds']:6.1f}s "
+                      f"{len(r['speakers']):5d} {'n/d':>7s}")
+                continue
+            print(f"{r['name']:20s} {r.get('modele', ''):13s} {r['seconds']:6.1f}s "
+                  f"{len(r['speakers']):5d} "
+                  f"{100 * m['der']:6.1f}% {100 * m['confusion']:7.1f}% "
+                  f"{100 * m['manquee']:7.1f}% {100 * m['fausse']:6.1f}%")
         else:
-            d = divergence(reference["annotation"], r["annotation"])
-            ecart = f"{100 * d:.1f}%" if d is not None else "n/d"
-        print(f"{r['name']:24s} {r['seconds']:7.1f}s {ratio:11.1f}× {gain:6.1f}× "
-              f"{len(r['speakers']):5d} {ecart:>8s}")
+            if r is reference:
+                ecart = "réf."
+            else:
+                d = divergence(reference["annotation"], r["annotation"], uem=uem)
+                ecart = f"{100 * d:.1f}%" if d is not None else "n/d"
+            print(f"{r['name']:24s} {r['seconds']:7.1f}s {ratio:11.1f}× {gain:6.1f}× "
+                  f"{len(r['speakers']):5d} {ecart:>8s}")
+
     for r in results:
         if r and "error" in r:
             print(f"{r['name']:24s}  ÉCHEC : {r['error']}")
-    print("-" * 78)
-    print("×temps réel : combien de secondes d'audio traitées par seconde de calcul.")
-    print("écart : divergence avec la référence (0 % = découpage identique).")
-    print("Un écart inférieur à ~5 % est en général sans conséquence sur un transcript ;")
-    print("au-delà de ~15 %, vérifiez à l'oreille avant d'adopter le réglage.")
+    print("-" * largeur)
+
+    if reference_verite is not None:
+        print("DER : part du temps de parole mal traitée — plus bas vaut mieux.")
+        print("confus. : parole attribuée au mauvais locuteur. C'est le terme que")
+        print("          dégradent les chevauchements, et celui que vise un changement")
+        print("          de modèle de diarisation.")
+        print("manquée : parole non détectée. Relève de la prise de son ou du seuil")
+        print("          de détection, pas du modèle de locuteurs.")
+        print("fausse  : silence ou bruit pris pour de la parole.")
+        print("\nCes chiffres sont mesurés sur VOS enregistrements et sur les frontières")
+        print("de segments de Whisper : comparables entre eux, mais pas avec les DER")
+        print("publiées sur des corpus de référence comme AMI ou DIHARD.")
+    else:
+        print("×temps réel : combien de secondes d'audio traitées par seconde de calcul.")
+        print("écart : divergence avec la référence (0 % = découpage identique).")
+        print("Un écart inférieur à ~5 % est en général sans conséquence sur un transcript ;")
+        print("au-delà de ~15 %, vérifiez à l'oreille avant d'adopter le réglage.")
+        print("\nAttention : la divergence ne dit pas qui a raison. Pour départager deux")
+        print("modèles, relisez dix minutes dans la fenêtre de vérification et relancez")
+        print("avec --reference sortie_xxx/xxx_transcript.json.")
 
     if valides:
         meilleur = min(valides, key=lambda r: r["seconds"])
