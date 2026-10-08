@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installation complète, en une commande, SUR CETTE MACHINE :
-# ffmpeg, pipeline Python (transcription + diarisation + résumé), Ollama +
-# Mistral, puis compilation et installation de l'app.
+# ffmpeg, pipeline Python (transcription + diarisation + résumé), Ollama et
+# son modèle de résumé, puis compilation et installation de l'app.
 #
 # Pensé pour tourner à l'identique sur plusieurs machines : chaque
 # installation est indépendante et 100 % locale (rien n'est partagé entre
@@ -16,6 +16,7 @@
 # Variables surchargeables (exemple : PIPELINE_DIR=~/ma_config ./install.sh) :
 #   PIPELINE_DIR   dossier du pipeline Python   (défaut : ~/transcription_pipeline)
 #   APP_DEST_DIR   dossier d'installation de l'app (défaut : ~/Applications)
+#   OLLAMA_MODEL   modèle de résumé à télécharger (défaut : mistral-small3.2)
 #   SKIP_OLLAMA=1  pour sauter Ollama/Mistral (résumé automatique indisponible)
 set -euo pipefail
 
@@ -23,6 +24,10 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE_DIR="${PIPELINE_DIR:-$HOME/transcription_pipeline}"
 APP_DEST_DIR="${APP_DEST_DIR:-$HOME/Applications}"
 SKIP_OLLAMA="${SKIP_OLLAMA:-0}"
+# Doit rester le modèle demandé par défaut par pipeline/summarize.py : si les
+# deux divergent, l'installation réussit mais le résumé échoue au premier
+# essai sur une erreur de modèle introuvable.
+OLLAMA_MODEL="${OLLAMA_MODEL:-mistral-small3.2}"
 APP_TARGET="TranscriptionTableRonde"
 XCODEPROJ="$REPO_DIR/app/${APP_TARGET}.xcodeproj"
 
@@ -92,7 +97,7 @@ echo "Vérification de la logique d'alignement (tests unitaires, hors ligne)…"
 (cd "$PIPELINE_DIR" && "$PIPELINE_DIR/venv/bin/python3" test_align.py)
 
 echo ""
-echo "=== 3/5 : Ollama + Mistral (résumé structuré) ==="
+echo "=== 3/5 : Ollama + modèle de résumé (résumé structuré) ==="
 if [ "$SKIP_OLLAMA" = "1" ]; then
     echo "SKIP_OLLAMA=1 : étape sautée (le résumé automatique ne sera pas disponible)."
 else
@@ -104,8 +109,20 @@ else
     fi
     echo "Démarrage du service Ollama en arrière-plan (si pas déjà lancé)…"
     brew services start ollama >/dev/null 2>&1 || true
-    echo "Téléchargement du modèle Mistral (peut prendre plusieurs minutes)…"
-    ollama pull mistral
+    # Un modèle de 24 milliards de paramètres lit le français avec beaucoup
+    # plus de finesse qu'un 7B : c'est le premier facteur de qualité des
+    # résumés. Compter environ 15 Go de téléchargement, et autant de mémoire
+    # unifiée disponible à l'exécution.
+    echo "Téléchargement de $OLLAMA_MODEL (environ 15 Go, plusieurs minutes)…"
+    if ! ollama pull "$OLLAMA_MODEL"; then
+        echo ""
+        echo "Échec du téléchargement de $OLLAMA_MODEL."
+        echo "Repli sur « mistral » (7B, environ 4 Go) : les résumés seront plus"
+        echo "superficiels, mais le reste de l'installation se poursuit."
+        echo "Pensez alors à lancer les résumés avec --model mistral."
+        ollama pull mistral \
+            || echo "Attention : aucun modèle de résumé installé, le résumé automatique échouera."
+    fi
 fi
 
 echo ""

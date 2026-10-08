@@ -30,7 +30,7 @@ moteurs tournent entièrement sur la machine :
 
 - **[mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper)** — reconnaissance vocale (audio → texte), optimisée pour les puces Apple Silicon.
 - **[pyannote.audio](https://github.com/pyannote/pyannote-audio)** — diarisation (qui parle, et quand), c'est-à-dire la détection et la séparation des différents locuteurs.
-- **[Ollama](https://ollama.com) + Mistral** — génération du résumé structuré, un modèle de langage local qui lit le transcript et en extrait une synthèse organisée par catégories.
+- **[Ollama](https://ollama.com) + `mistral-small3.2`** — génération du résumé structuré, un modèle de langage local qui lit le transcript et en extrait une synthèse organisée par catégories.
 
 Seule exception : la récupération du modèle de diarisation pyannote
 nécessite un compte [Hugging Face](https://huggingface.co) gratuit (accès à
@@ -65,8 +65,8 @@ des outils pour vérifier/corriger et résumer les résultats.
 ### 2.0 Installation automatique (recommandé)
 
 Un script installe tout en une commande : ffmpeg, pipeline Python complet
-(avec son environnement virtuel), Ollama + Mistral, puis compile et installe
-l'application dans `~/Applications`.
+(avec son environnement virtuel), Ollama et son modèle de résumé, puis
+compile et installe l'application dans `~/Applications`.
 
 ```bash
 git clone https://github.com/rolandcahen/TranscriptionTableRonde.git
@@ -75,10 +75,10 @@ chmod +x TranscriptionTableRonde_install.sh
 ./TranscriptionTableRonde_install.sh
 ```
 
-Comptez 10 à 20 minutes (le téléchargement de `torch` et du modèle Mistral
-sont les étapes les plus longues). Le script vérifie Xcode et Homebrew au
-démarrage et s'arrête avec un message clair s'ils manquent, plutôt que de
-laisser une installation à moitié faite.
+Comptez 10 à 20 minutes (le téléchargement de `torch` et du modèle de
+résumé, environ 15 Go, sont les étapes les plus longues). Le script vérifie
+Xcode et Homebrew au démarrage et s'arrête avec un message clair s'ils
+manquent, plutôt que de laisser une installation à moitié faite.
 
 Il est prévu pour être relancé à l'identique sur plusieurs Mac : chaque
 installation est indépendante et entièrement locale (rien n'est partagé, ni
@@ -145,8 +145,13 @@ cd -
 
 ```bash
 brew install ollama
-ollama pull mistral
+ollama pull mistral-small3.2
 ```
+
+C'est bien `mistral-small3.2` qu'il faut télécharger, et non `mistral` : le
+premier est le modèle de 24 milliards de paramètres que `summarize.py`
+demande par défaut, le second un 7B qui ne sert que de repli quand la
+mémoire manque.
 
 **5. Compiler et lancer l'application**
 
@@ -703,10 +708,18 @@ brancher un écran externe.
 
 Une fois un transcript disponible (brut ou corrigé), le bouton « Générer le
 résumé structuré » lance une analyse locale via Ollama. Le modèle par défaut
-est `mistral-small3.2:24b` : un modèle de 24 milliards de paramètres lit le
+est `mistral-small3.2` : un modèle de 24 milliards de paramètres lit le
 français avec beaucoup plus de finesse qu'un 7B, et c'est le premier facteur
 de qualité. `--model mistral` revient à un modèle plus léger si la mémoire
 manque.
+
+Le nom est donné sans numéro de version, volontairement. Ollama traite
+`mistral-small3.2` et `mistral-small3.2:24b` comme deux entrées distinctes
+dans son catalogue local, même lorsqu'elles désignent le même modèle et
+partagent les mêmes fichiers sur le disque ; demander une étiquette précise
+par l'interface échoue donc avec une erreur de modèle introuvable si c'est
+l'autre qui a été téléchargée. Sans numéro de version, Ollama résout vers
+l'étiquette `latest` réellement installée.
 
 ### Trois passes, et pourquoi
 

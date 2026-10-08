@@ -42,7 +42,7 @@ Sorties, dans le même dossier que l'entrée :
 
 Utilisation :
     python3 summarize.py --input sortie/reunion_transcript.json
-    python3 summarize.py --input sortie/reunion_final.txt --model mistral-small3.2:24b
+    python3 summarize.py --input sortie/reunion_final.txt --model mistral
     python3 summarize.py --input sortie/reunion_final.txt --grille descriptive
 """
 from __future__ import annotations
@@ -628,10 +628,12 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="Fichier *_final.txt ou *_transcript.json")
     parser.add_argument("--output", default=None, help="Dossier de sortie (défaut : celui de --input)")
     parser.add_argument(
-        "--model", default="mistral-small3.2:24b",
-        help="Modèle Ollama (défaut : mistral-small3.2:24b). Un modèle de 24 à 32 "
-        "milliards de paramètres lit le français avec beaucoup plus de finesse qu'un 7B ; "
-        "repliez-vous sur « mistral » si la mémoire manque.",
+        "--model", default="mistral-small3.2",
+        help="Modèle Ollama (défaut : mistral-small3.2, sans numéro de version : "
+        "Ollama résout alors vers l'étiquette « latest » réellement installée, au lieu "
+        "d'exiger une étiquette précise qui peut manquer sur la machine). Un modèle de "
+        "24 à 32 milliards de paramètres lit le français avec beaucoup plus de finesse "
+        "qu'un 7B ; repliez-vous sur « mistral » si la mémoire manque.",
     )
     parser.add_argument("--ollama-url", default="http://localhost:11434")
     parser.add_argument(

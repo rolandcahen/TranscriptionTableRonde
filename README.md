@@ -34,8 +34,8 @@ modèles (Hugging Face), ensuite mis en cache — jamais l'audio lui-même.
 ## Installation (recommandé : un seul script)
 
 Un script installe tout automatiquement : ffmpeg, l'environnement Python du
-pipeline et ses dépendances, Ollama + Mistral, puis il compile et installe
-l'application.
+pipeline et ses dépendances, Ollama et son modèle de résumé, puis il compile
+et installe l'application.
 
 ```bash
 git clone https://github.com/rolandcahen/TranscriptionTableRonde.git
@@ -45,9 +45,9 @@ chmod +x TranscriptionTableRonde_install.sh
 ```
 
 Comptez 10 à 20 minutes selon votre connexion (le téléchargement de `torch`
-et du modèle Mistral sont les étapes les plus longues). Le script s'arrête
-avec un message clair si Xcode ou Homebrew manquent, plutôt que de tenter
-une installation à moitié faite.
+et du modèle de résumé, environ 15 Go, sont les étapes les plus longues). Le
+script s'arrête avec un message clair si Xcode ou Homebrew manquent, plutôt
+que de tenter une installation à moitié faite.
 
 Ce script est conçu pour être relancé à l'identique sur plusieurs machines :
 chaque installation est indépendante et 100 % locale (rien n'est partagé ni
@@ -61,6 +61,12 @@ Par défaut, le script installe dans `~/transcription_pipeline` (pipeline) et
 ```bash
 PIPELINE_DIR=~/ma_config APP_DEST_DIR=/Applications ./TranscriptionTableRonde_install.sh
 ```
+
+Le modèle de résumé installé est `mistral-small3.2` (24 milliards de
+paramètres, environ 15 Go, et autant de mémoire unifiée disponible au moment
+du résumé). Sur une machine plus modeste, `OLLAMA_MODEL=mistral` installe le
+7B à la place — les résumés sont alors plus superficiels, et il faut penser à
+lancer `summarize.py --model mistral`.
 
 Pour sauter Ollama/Mistral (résumé automatique désactivé) :
 `SKIP_OLLAMA=1 ./TranscriptionTableRonde_install.sh`.
